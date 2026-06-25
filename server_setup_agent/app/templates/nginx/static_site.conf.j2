@@ -1,0 +1,13 @@
+server {
+    listen 80;
+    server_name {{ domain }};
+    root {{ app_path }};
+    index index.html;
+
+    access_log /var/log/nginx/{{ app_name }}.access.log;
+    error_log /var/log/nginx/{{ app_name }}.error.log;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
