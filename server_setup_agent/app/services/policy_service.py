@@ -27,7 +27,7 @@ class PolicyService:
         Validates the command against the deny list.
         Raises SecurityViolationError if the command is blocked.
         """
-        # Check against explicitly denied patterns
+      
         for denied in self.deny_list:
             if denied in command:
                 raise SecurityViolationError(f"Command contains forbidden pattern: '{denied}'")

@@ -82,7 +82,7 @@ class SetupAgent:
         system_message = "You are an expert Linux sysadmin responsible for server setup and configuration. Use your tools to fulfill the user request."
         
         # create_react_agent builds a robust LangGraph state machine loop
-        self.agent_executor = create_react_agent(self.llm, self.tools, state_modifier=system_message)
+        self.agent_executor = create_react_agent(self.llm, self.tools, prompt=system_message)
 
     def execute_task(self, query: str) -> str:
         """

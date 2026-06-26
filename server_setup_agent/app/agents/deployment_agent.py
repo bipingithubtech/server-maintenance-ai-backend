@@ -1,6 +1,9 @@
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 from langchain_core.tools import StructuredTool
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import SystemMessage, AIMessage
+from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, MessagesState, END
+from loguru import logger
 
 from app.services.llm_service import get_llm
 from app.executors.executor_factory import ExecutorFactory
@@ -10,54 +13,184 @@ from app.tools.nginx_tool import NginxTool
 from app.tools.systemd_tool import SystemdTool
 from app.tools.docker_tool import DockerTool
 from app.tools.linux_tool import LinuxTool
+from app.tools.pm2_tool import PM2Tool
+
+from app.prompts.deployment_prompt import DEPLOYMENT_PROMPT
+
 
 class DeploymentAgent:
     """
-    Agent responsible for orchestrating application deployments (React, FastAPI, Docker, Nginx).
+    Agent responsible for orchestrating application deployments.
     Credentials are held securely by the Executor and NEVER sent to the LLM.
     """
 
     def __init__(self, executor_type: str = "local", executor_config: Dict[str, Any] = None):
         if executor_config is None:
             executor_config = {}
-            
+
         self.executor = ExecutorFactory.get_executor(executor_type, **executor_config)
-        
-        # Instantiate required tools
-        pkg_tool = PackageTool(self.executor)
-        nginx_tool = NginxTool(self.executor)
-        sys_tool = SystemdTool(self.executor)
+
+        pkg_tool    = PackageTool(self.executor)
+        nginx_tool  = NginxTool(self.executor)
+        sys_tool    = SystemdTool(self.executor)
         docker_tool = DockerTool(self.executor)
-        linux_tool = LinuxTool(self.executor) 
-        
-        # Wrap methods as LangChain Tools
+        linux_tool  = LinuxTool(self.executor)
+        pm2_tool    = PM2Tool(self.executor)
+
         self.tools = [
-            StructuredTool.from_function(func=pkg_tool.install, name="install_package", description="Installs an apt package (e.g., git, nodejs)."),
-            StructuredTool.from_function(func=nginx_tool.install, name="install_nginx", description="Installs Nginx."),
-            StructuredTool.from_function(func=nginx_tool.start, name="start_nginx", description="Starts and enables Nginx."),
-            StructuredTool.from_function(func=nginx_tool.restart, name="restart_nginx", description="Restarts Nginx."),
-            StructuredTool.from_function(func=nginx_tool.test_config, name="test_nginx_config", description="Tests Nginx configuration."),
-            StructuredTool.from_function(func=sys_tool.start_service, name="start_service", description="Starts a systemd service."),
-            StructuredTool.from_function(func=sys_tool.restart_service, name="restart_service", description="Restarts a systemd service."),
-            StructuredTool.from_function(func=sys_tool.check_status, name="check_service_status", description="Checks status of a systemd service."),
-            StructuredTool.from_function(func=docker_tool.install, name="install_docker", description="Installs Docker."),
-            StructuredTool.from_function(func=docker_tool.start_service, name="start_docker_service", description="Starts Docker service."),
-            StructuredTool.from_function(func=linux_tool.run_custom_command, name="run_custom_command", description="Runs a generic shell command. Use this for operations like 'git clone', file copying, or echoing config blocks.")
+            # ── Package management ─────────────────────────────────────────
+            StructuredTool.from_function(func=pkg_tool.install, name="install_package",
+                description="Installs an apt package. Args: package_name."),
+
+            # ── Nginx ──────────────────────────────────────────────────────
+            StructuredTool.from_function(func=nginx_tool.install, name="install_nginx",
+                description="Installs Nginx."),
+            StructuredTool.from_function(
+                func=nginx_tool.generate_and_save_config,
+                name="nginx_deploy",
+                description="Generates+saves Nginx config. Args: framework(react/vite/static/fastapi/nodejs/nextjs/flask/django), domain, app_name, app_path(static only), port(proxy only,int)."),
+            StructuredTool.from_function(func=nginx_tool.test_config,  name="nginx_test",
+                description="Tests Nginx config. Run before enabling."),
+            StructuredTool.from_function(func=nginx_tool.enable_site,  name="nginx_enable",
+                description="Enables Nginx site. Args: app_name."),
+            StructuredTool.from_function(func=nginx_tool.reload_nginx, name="nginx_reload",
+                description="Reloads Nginx."),
+
+            # ── Systemd ────────────────────────────────────────────────────
+            StructuredTool.from_function(
+                func=sys_tool.create_service_file, name="systemd_create",
+                description="Creates systemd service. Args: service_name, exec_start, working_directory."),
+            StructuredTool.from_function(func=sys_tool.start_service,  name="systemd_start",
+                description="Starts systemd service. Args: service_name."),
+            StructuredTool.from_function(func=sys_tool.enable_service, name="systemd_enable",
+                description="Enables systemd service on boot. Args: service_name."),
+
+            # ── PM2 ────────────────────────────────────────────────────────
+            StructuredTool.from_function(func=pm2_tool.install, name="pm2_install",
+                description="Installs PM2 globally."),
+            StructuredTool.from_function(
+                func=pm2_tool.start, name="pm2_start",
+                description="Starts app with PM2. Args: app_name, script, working_directory."),
+            StructuredTool.from_function(func=pm2_tool.save, name="pm2_save",
+                description="Saves PM2 list for reboot persistence."),
+
+            # ── Docker ─────────────────────────────────────────────────────
+            StructuredTool.from_function(func=docker_tool.install,       name="docker_install",
+                description="Installs Docker."),
+            StructuredTool.from_function(func=docker_tool.start_service, name="docker_start",
+                description="Starts Docker service."),
+
+            # ── Shell ──────────────────────────────────────────────────────
+            StructuredTool.from_function(
+                func=linux_tool.run_custom_command, name="run",
+                description="Runs a shell command (git clone, npm install, pip install, mkdir, etc). Raises on failure."),
+            StructuredTool.from_function(
+                func=linux_tool.inspect_path, name="inspect",
+                description="Runs read-only command (ls, test -f) without raising. Use for verification."),
         ]
-        
+
         self.llm = get_llm()
-        system_message = (
-            "You are an expert DevOps engineer specializing in application deployments. "
-            "Use your tools to deploy the requested applications. If you need to clone repositories "
-            "or write configuration files (like nginx blocks), use the 'run_custom_command' tool."
+        self._build_graph()
+
+    def _build_graph(self):
+        """
+        Builds the LangGraph ReAct loop with ToolNode(handle_tool_errors=True).
+
+        The system prompt is injected ONCE at graph entry — not on every loop
+        iteration — so Groq never sees duplicate system messages mid-conversation.
+        """
+        # Force the LLM to call tools one at a time.
+        # parallel_tool_calls=False is the only reliable way to prevent the model
+        # from batching all steps in a single response before seeing any results.
+        llm_with_tools = self.llm.bind_tools(
+            self.tools,
+            parallel_tool_calls=False,
         )
-        
-        self.agent_executor = create_react_agent(self.llm, self.tools, state_modifier=system_message)
+
+        tool_node = ToolNode(
+            self.tools,
+            # Catch RuntimeError from tools and return it as a ToolMessage so
+            # the LLM can read the error and decide how to recover.
+            handle_tool_errors=True,
+        )
+
+        def call_model(state: MessagesState):
+            """LLM node — injects system prompt only on the very first call."""
+            messages = state["messages"]
+            # Only prepend system prompt if it hasn't been added yet
+            if not isinstance(messages[0], SystemMessage):
+                messages = [SystemMessage(content=DEPLOYMENT_PROMPT)] + list(messages)
+
+            # Trim history to keep token usage under 6000 TPM limit:
+            # Always keep: system prompt + first user message + last 10 messages
+            MAX_RECENT = 10
+            if len(messages) > MAX_RECENT + 2:
+                messages = messages[:2] + messages[-(MAX_RECENT):]
+
+            # Truncate tool results — only last 3 lines, max 150 chars
+            from langchain_core.messages import ToolMessage
+            trimmed = []
+            for msg in messages:
+                if isinstance(msg, ToolMessage):
+                    content = str(msg.content)
+                    # Keep only last 3 non-empty lines
+                    lines = [l for l in content.splitlines() if l.strip()]
+                    short = "\n".join(lines[-3:]) if lines else content
+                    if len(short) > 150:
+                        short = short[-150:]
+                    trimmed.append(ToolMessage(
+                        content=short,
+                        tool_call_id=msg.tool_call_id,
+                        name=msg.name,
+                    ))
+                else:
+                    trimmed.append(msg)
+            messages = trimmed
+
+            response = llm_with_tools.invoke(messages)
+            return {"messages": [response]}
+
+        def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
+            last = state["messages"][-1]
+            if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+                return "tools"
+            return END
+
+        graph = StateGraph(MessagesState)
+        graph.add_node("agent", call_model)
+        graph.add_node("tools", tool_node)
+        graph.set_entry_point("agent")
+        graph.add_conditional_edges("agent", should_continue)
+        graph.add_edge("tools", "agent")
+        self.agent_executor = graph.compile()
 
     def execute_task(self, query: str) -> str:
         """
         Runs the deployment request through the LangGraph agent.
+        Logs every tool call and result so you can follow the agent's reasoning.
         """
         inputs = {"messages": [("user", query)]}
-        result = self.agent_executor.invoke(inputs)
-        return result["messages"][-1].content
+        final_state = None
+
+        for state in self.agent_executor.stream(inputs, stream_mode="values"):
+            final_state = state
+            messages = state.get("messages", [])
+            if not messages:
+                continue
+            last = messages[-1]
+
+            # Log tool calls the LLM is about to make
+            if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+                for tc in last.tool_calls:
+                    args_preview = str(tc.get("args", {}))[:150]
+                    logger.info(f"[TOOL CALL]   {tc['name']}  {args_preview}")
+
+            # Log tool results (ToolMessage has a .name attribute)
+            elif hasattr(last, "name") and last.name and hasattr(last, "content"):
+                content_preview = str(last.content)[:300]
+                logger.info(f"[TOOL RESULT] {last.name}: {content_preview}")
+
+        if final_state is None:
+            return "Agent produced no output."
+
+        return final_state["messages"][-1].content

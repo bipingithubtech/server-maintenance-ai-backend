@@ -6,7 +6,7 @@ class LocalExecutor(BaseExecutor):
     """
     Executes commands on the local server where the agent is running.
     """
-
+    
     def _run(self, command: str) -> Tuple[int, str, str]:
         try:
             result = subprocess.run(

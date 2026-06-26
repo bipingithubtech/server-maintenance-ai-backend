@@ -30,3 +30,4 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     agent: str
     reason: str
+    result: Optional[str] = None  # The actual agent execution output
