@@ -1,9 +1,6 @@
 import re
 from typing import Optional
 
-
-# Module-level registry of secrets to scrub from anything sent to the LLM.
-# Populated once at request time by register_credentials(); never stored elsewhere.
 _REGISTERED_SECRETS: list[str] = []
 
 

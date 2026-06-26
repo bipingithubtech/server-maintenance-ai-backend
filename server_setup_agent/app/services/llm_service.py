@@ -47,12 +47,12 @@ class RateLimitAwareChatGroq(ChatGroq):
         if m:
             return int(m.group(1)) * 60 + float(m.group(2)) + 1.0
 
-        # Try seconds only: "1.5s"
+       
         m = re.search(r'([\d.]+)s', error_message)
         if m:
             return float(m.group(1)) + 1.0
 
-        # Try milliseconds: "130ms"
+       
         m = re.search(r'(\d+)ms', error_message)
         if m:
             return int(m.group(1)) / 1000.0 + 0.5

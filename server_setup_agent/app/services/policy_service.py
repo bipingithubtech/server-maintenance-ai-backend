@@ -14,7 +14,7 @@ class PolicyService:
 
     def _load_policies(self, config_path: str):
         if not os.path.exists(config_path):
-            # If not found, fallback to empty lists and trust the sanitizer
+            
             return
             
         with open(config_path, 'r') as f:
@@ -31,10 +31,7 @@ class PolicyService:
         for denied in self.deny_list:
             if denied in command:
                 raise SecurityViolationError(f"Command contains forbidden pattern: '{denied}'")
-
-        # For this setup, we rely on the deny list to block destructive actions.
-        # Strict allow-listing of every bash combo can break pipelines.
         return True
 
-# Singleton instance
+
 policy_service = PolicyService()
