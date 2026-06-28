@@ -39,7 +39,20 @@ class LinuxTool:
                 )
                 exit_code, stdout, stderr = self.executor.execute(pull_cmd)
 
-        # Auto-recover: git "could not create work tree" — sudo mkdir + chown, retry
+        # Auto-recover: npm ERESOLVE peer dependency conflict — retry with --legacy-peer-deps
+        if exit_code != 0 and "ERESOLVE" in stderr and "npm" in command:
+            legacy_cmd = command.replace("npm install", "npm install --legacy-peer-deps")
+            if legacy_cmd != command:
+                exit_code, stdout, stderr = self.executor.execute(legacy_cmd)
+
+        # Auto-recover: npm ENOTEMPTY — corrupted node_modules, clean and retry
+        if exit_code != 0 and "ENOTEMPTY" in stderr and "node_modules" in stderr:
+            prefix_match = __import__('re').search(r'--prefix\s+(\S+)', command)
+            app_path = prefix_match.group(1) if prefix_match else None
+            if app_path:
+                self.executor.execute(f"rm -rf {app_path}/node_modules/.cache")
+                self.executor.execute(f"rm -rf {app_path}/node_modules/.glob-*")
+                exit_code, stdout, stderr = self.executor.execute(command)
         if exit_code != 0 and "could not create work tree dir" in stderr:
             match = re.search(r"could not create work tree dir '([^']+)'", stderr)
             if match:

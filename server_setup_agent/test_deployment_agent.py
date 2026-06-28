@@ -11,7 +11,7 @@ def main():
         }
     )
 
-    query = "Deploy my application to the server git@github.com:Meetri-IT/voice_ai_frontend.git. Stack is Vite/React."
+    query = "Deploy my application to the server https://github.com/Meetri-IT/pm-backend.git. Stack is nest js."
 
     print(f"--- Sending query ---\n{query}\n")  
     response = agent.execute_task(query)

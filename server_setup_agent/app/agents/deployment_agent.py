@@ -115,9 +115,16 @@ class DeploymentAgent:
         )
 
         def call_model(state: MessagesState):
-            """LLM node — injects system prompt only on the very first call."""
+            """LLM node — injects system prompt, trims history, stops if done."""
             messages = state["messages"]
-            # Only prepend system prompt if it hasn't been added yet
+
+            # Stop immediately if deployment already completed
+            for msg in messages[-3:]:
+                if "DEPLOYMENT COMPLETE" in str(getattr(msg, "content", "")):
+                    # Return a final AI message with no tool calls to end the loop
+                    from langchain_core.messages import AIMessage as AI
+                    return {"messages": [AI(content="Deployment completed successfully.")]}
+
             if not isinstance(messages[0], SystemMessage):
                 messages = [SystemMessage(content=DEPLOYMENT_PROMPT)] + list(messages)
 
@@ -152,6 +159,9 @@ class DeploymentAgent:
 
         def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
             last = state["messages"][-1]
+            # Stop if deployment is complete
+            if hasattr(last, "content") and "DEPLOYMENT COMPLETE" in str(last.content):
+                return END
             if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
                 return "tools"
             return END
@@ -167,10 +177,12 @@ class DeploymentAgent:
     def execute_task(self, query: str) -> str:
         """
         Runs the deployment request through the LangGraph agent.
-        Logs every tool call and result so you can follow the agent's reasoning.
+        Logs every tool call, result, and LLM response time.
         """
+        import time
         inputs = {"messages": [("user", query)]}
         final_state = None
+        llm_call_start = None
 
         for state in self.agent_executor.stream(inputs, stream_mode="values"):
             final_state = state
@@ -179,16 +191,28 @@ class DeploymentAgent:
                 continue
             last = messages[-1]
 
-            # Log tool calls the LLM is about to make
+            # AIMessage with tool calls — LLM responded
             if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+                if llm_call_start:
+                    elapsed = time.time() - llm_call_start
+                    logger.info(f"[GROQ] Response received in {elapsed:.1f}s")
                 for tc in last.tool_calls:
                     args_preview = str(tc.get("args", {}))[:150]
                     logger.info(f"[TOOL CALL]   {tc['name']}  {args_preview}")
+                llm_call_start = None
 
-            # Log tool results (ToolMessage has a .name attribute)
+            # ToolMessage — tool executed, now waiting for LLM again
             elif hasattr(last, "name") and last.name and hasattr(last, "content"):
                 content_preview = str(last.content)[:300]
                 logger.info(f"[TOOL RESULT] {last.name}: {content_preview}")
+                llm_call_start = time.time()
+                logger.debug(f"[GROQ] Waiting for LLM response...")
+
+            # AIMessage without tool calls — final response
+            elif isinstance(last, AIMessage) and not getattr(last, "tool_calls", None):
+                if llm_call_start:
+                    elapsed = time.time() - llm_call_start
+                    logger.info(f"[GROQ] Final response in {elapsed:.1f}s")
 
         if final_state is None:
             return "Agent produced no output."

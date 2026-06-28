@@ -32,7 +32,8 @@ class NginxTool:
 
         self.jinja_env = Environment(
             loader=FileSystemLoader(str(self.templates_dir)),
-            autoescape=select_autoescape()
+            autoescape=select_autoescape(),
+            auto_reload=True,  # Always reload templates from disk, never use cache
         )
 
     def generate_config(
@@ -170,13 +171,23 @@ class NginxTool:
         return err if err else out
 
     def reload_nginx(self) -> str:
-        """Reloads the Nginx service."""
+        """Reloads Nginx, or starts it if not currently active."""
         exit_code, out, err = self.executor.execute("sudo systemctl reload nginx")
-        if exit_code != 0:
-            logger.error(f"Failed to reload Nginx: {err}")
-            raise RuntimeError(f"Failed to reload Nginx:\n{err}")
-        logger.info("Successfully reloaded Nginx.")
-        return "Nginx reloaded successfully."
+        if exit_code == 0:
+            logger.info("Successfully reloaded Nginx.")
+            return "DEPLOYMENT COMPLETE. Nginx reloaded successfully."
+
+        if "not active" in err or "not running" in err.lower():
+            start_code, start_out, start_err = self.executor.execute(
+                "sudo systemctl start nginx"
+            )
+            if start_code == 0:
+                logger.info("Nginx was not running — started successfully.")
+                return "DEPLOYMENT COMPLETE. Nginx started successfully."
+            raise RuntimeError(f"Failed to start Nginx:\n{start_err}")
+
+        logger.error(f"Failed to reload Nginx: {err}")
+        raise RuntimeError(f"Failed to reload Nginx:\n{err}")
 
     def delete_site(self, app_name: str) -> str:
         """Removes the site config from both available and enabled."""

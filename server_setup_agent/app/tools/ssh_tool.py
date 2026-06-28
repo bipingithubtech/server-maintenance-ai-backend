@@ -14,11 +14,8 @@ class SSHTool:
         """
         cmd = "ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q"
         if email:
-            cmd = f"ssh-keygen -t ed25519 -C '{email}' -N '' -f ~/.ssh/id_ed25519 -q"
-            
+            cmd = f"ssh-keygen -t ed25519 -C '{email}' -N '' -f ~/.ssh/id_ed25519 -q"           
         exit_code, out, err = self.executor.execute(cmd)
-        # If key already exists, ssh-keygen exits with non-zero or prompts. We force non-interactive.
-        # A better approach in production is checking if the file exists first.
         if exit_code != 0:
             # Check if it failed because it already exists
             code, _, _ = self.executor.execute("test -f ~/.ssh/id_ed25519")

@@ -13,9 +13,7 @@ class PM2Tool:
 
     def install(self) -> str:
         """Installs PM2 globally via npm."""
-        exit_code, out, err = self.executor.execute(
-            "sudo npm install -g pm2"
-        )
+        exit_code, out, err = self.executor.execute("sudo npm install -g pm2")
         if exit_code != 0:
             raise RuntimeError(f"Failed to install PM2:\n{err}")
         logger.info("PM2 installed successfully.")
@@ -30,21 +28,25 @@ class PM2Tool:
     ) -> str:
         """
         Starts an app with PM2.
-
-        Args:
-            app_name: Unique PM2 process name (e.g. 'myapp').
-            script: Entry point relative to working_directory (e.g. 'index.js',
-                    '.next/standalone/server.js', 'dist/main.js').
-            working_directory: Absolute path to the app folder.
-            interpreter: 'node' for most apps. Use 'none' for compiled binaries.
+        For Next.js apps, use script='npm' and the args 'run start' will be added automatically.
         """
-        cmd = (
-            f"cd {working_directory} && "
-            f"pm2 start {script} --name {app_name} "
-            f"--interpreter {interpreter} "
-            f"--cwd {working_directory} "
-            f"-- --restart-delay=3000 || pm2 restart {app_name}"
-        )
+        # For Next.js: pm2 start npm --name app -- run start
+        if script in ("npm", "yarn") or script.endswith("npm"):
+            cmd = (
+                f"cd {working_directory} && "
+                f"pm2 start npm --name {app_name} -- run start"
+            )
+        else:
+            cmd = (
+                f"cd {working_directory} && "
+                f"pm2 start {script} --name {app_name} "
+                f"--interpreter {interpreter} "
+                f"--cwd {working_directory}"
+            )
+
+        # Delete existing instance first to avoid duplicates
+        self.executor.execute(f"pm2 delete {app_name} 2>/dev/null || true")
+
         exit_code, out, err = self.executor.execute(cmd)
         if exit_code != 0:
             raise RuntimeError(f"Failed to start {app_name} with PM2:\n{err}\n{out}")
