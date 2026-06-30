@@ -11,7 +11,6 @@ class RateLimitAwareChatGroq(ChatGroq):
     ChatGroq subclass that automatically retries on 429 rate limit errors.
     Parses the Groq retry-after time from the error message and waits.
     """
-
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         max_retries = 5
         current_messages = list(messages)
@@ -21,13 +20,9 @@ class RateLimitAwareChatGroq(ChatGroq):
                 return super()._generate(current_messages, stop=stop, run_manager=run_manager, **kwargs)
             except Exception as e:
                 err_str = str(e)
-
-                # ── 400 tool_use_failed: Groq generated malformed tool XML ──
-                # This happens when conversation history is too long / complex.
-                # Fix: progressively trim middle messages and retry immediately.
                 if "400" in err_str and ("tool_use_failed" in err_str or "Failed to call a function" in err_str):
                     if attempt < max_retries - 1:
-                        # Keep system + first user + last N messages, shrinking each retry
+                        
                         keep_recent = max(2, 6 - attempt * 2)
                         if len(current_messages) > keep_recent + 2:
                             current_messages = current_messages[:2] + current_messages[-keep_recent:]
@@ -39,7 +34,6 @@ class RateLimitAwareChatGroq(ChatGroq):
                             continue
                     raise
 
-                # ── 429 / rate limit ──────────────────────────────────────
                 if "429" in err_str or "413" in err_str or "rate_limit_exceeded" in err_str:
                     if "413" in err_str or "Request too large" in err_str:
                         raise

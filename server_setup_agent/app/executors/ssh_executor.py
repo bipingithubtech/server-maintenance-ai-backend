@@ -6,15 +6,15 @@ from app.executors.base_executor import BaseExecutor
 # Default timeout for most commands (seconds).
 # Build/install commands (npm install, npm run build, pip install) can take
 # longer — they use LONG_RUNNING_TIMEOUT.
-DEFAULT_TIMEOUT     = 120   # 2 min  — general commands
-LONG_RUNNING_TIMEOUT = 600  # 10 min — build / install commands
+DEFAULT_TIMEOUT      = 120   # 2 min  — general commands
+LONG_RUNNING_TIMEOUT = 1800  # 30 min — build / install commands (docker build can take 15+ min)
 
 # Keywords that indicate a long-running command that needs more time
 _LONG_RUNNING_KEYWORDS = (
     "npm install", "npm run build", "npm run", "yarn install", "yarn build",
     "pip install", "apt-get install", "apt-get update",
     "git clone", "git pull",
-    "docker build", "docker pull",
+    "docker build", "docker pull", "docker run",
 )
 
 

@@ -1,0 +1,24 @@
+{
+  "tasks": [
+    "base",
+    "nginx",
+    "nodejs",
+    "pm2",
+    "docker",
+    "python",
+    "ssh_harden",
+    "fail2ban",
+    "firewall",
+    "auto_updates"
+  ],
+  "infra_services": [
+    "postgres"
+  ],
+  "extra_packages": [],
+  "extra_commands": [],
+  "firewall_ports": [
+    "5432"
+  ],
+  "server_purpose": "web server with Node.js, Python, Postgres, and security features",
+  "new_username": ""
+}

@@ -1,274 +1,641 @@
-from typing import Dict, Any, List
-from langchain_core.tools import StructuredTool
-from langgraph.prebuilt import create_react_agent
+"""
+SetupAgent — Server initial setup with one LLM call.
+
+Phase 1 (ONE LLM call):
+  - Understands what the user wants to set up
+  - Shows the plan (what will be installed/configured)
+  - Asks if they want to add anything else
+  - Saves the setup plan to setup_context.json
+
+Phase 2 (Direct Python — no LLM):
+  - Executes each step directly using tool classes
+  - No LangGraph loops, no token waste
+
+Supported setup tasks:
+  - base           : apt update + upgrade + essential packages
+  - nginx          : install + start nginx
+  - docker         : install + start docker
+  - nodejs         : install nodejs + npm
+  - pm2            : install pm2 globally
+  - python         : install python3 + pip + venv
+  - firewall       : UFW setup (deny all, allow SSH/80/443 as relevant + custom ports)
+  - fail2ban       : SSH brute-force protection
+  - ssh_harden     : disable root login, disable password auth, set MaxAuthTries
+  - bootstrap_user : create a new sudo user with SSH key access (root-only fresh server flow)
+  - auto_updates   : enable unattended-upgrades for automatic security patches
+  - custom         : any additional packages/commands the user specifies
+"""
+
+import json
+import re
+import secrets
+import string
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional
+
+from langchain_core.messages import SystemMessage, HumanMessage
 from loguru import logger
 
 from app.services.llm_service import get_llm
+from app.services.teams_alert_service import TeamsAlerter
 from app.executors.executor_factory import ExecutorFactory
-
-from app.tools.package_tool import PackageTool
-from app.tools.firewall_tool import FirewallTool
-from app.tools.user_tool import UserTool
-from app.tools.security_tool import SecurityTool
-from app.tools.nginx_tool import NginxTool
-from app.tools.ssh_tool import SSHTool
-from app.tools.systemd_tool import SystemdTool
 from app.tools.linux_tool import LinuxTool
-from app.tools.monitoring_tool import MonitoringTool
-from app.tools.log_tool import LogTool
+from app.tools.package_tool import PackageTool
+from app.tools.nginx_tool import NginxTool
+from app.tools.firewall_tool import FirewallTool
+from app.tools.security_tool import SecurityTool
 from app.tools.docker_tool import DockerTool
 from app.tools.pm2_tool import PM2Tool
+from app.tools.ssh_tool import SSHTool
 
-# ── Per-batch system prompts ─────────────────────────────────────────────────
-BATCH_PROMPTS = {
-    "package":  "You are a Linux sysadmin. Call update_package_lists once and then stop. Do NOT install any packages.",
-    "security": "You are a Linux sysadmin. Install fail2ban and disable root SSH login. Report what you did.",
-    "firewall": "You are a Linux sysadmin. Enable UFW and allow ports 22, 80, 443. Report what you did.",
-    "user":     "You are a Linux sysadmin. Do NOT create, delete, or modify any users or groups. Report 'No user changes needed' and stop.",
-    "ssh":      "You are a Linux sysadmin. Do NOT generate any SSH keys. Call get_ssh_public_key once to check if a key exists. Report the result and stop.",
-    "nginx":    "You are a Linux sysadmin. Call install_nginx first, then call start_nginx. Do not configure any site. Report what you did.",
-    "systemd":  "You are a Linux sysadmin. Do NOT create or start any services. Report 'No systemd changes needed' and stop.",
-    "docker":   "You are a Linux sysadmin. Call is_docker_installed first. If not installed, call install_docker, then call start_docker. Report what you did.",
-    "pm2":      "You are a Linux sysadmin. Install PM2 globally if not installed. Do not start any app unless specific app name and script are given. Report what you did.",
-    "monitor":  "You are a Linux sysadmin. Report CPU, RAM, and disk usage.",
-    "log":      "You are a Linux sysadmin. Fetch syslog or journalctl output as requested. Report what you found.",
-}
 
-# ── Keyword → batch routing ───────────────────────────────────────────────────
-_ROUTES = [
-    (["nginx", "site", "proxy", "domain", "vhost", "web"],       "nginx"),
-    (["docker", "container", "image"],                            "docker"),
-    (["pm2", "node", "nextjs", "nestjs"],                         "pm2"),
-    (["systemd", "service", "unit", "daemon"],                    "systemd"),
-    (["firewall", "ufw", "port", "allow", "deny"],                "firewall"),
-    (["user", "group", "useradd", "usermod"],                     "user"),
-    (["ssh", "key", "keypair", "authorized"],                     "ssh"),
-    (["security", "fail2ban", "harden", "root login"],            "security"),
-    (["log", "journal", "syslog", "tail"],                        "log"),
-    (["cpu", "ram", "disk", "memory", "monitor", "usage"],        "monitor"),
-    (["install", "remove", "package", "apt", "update"],           "package"),
-]
+# ── Setup context ──────────────────────────────────────────────────────────────
 
-# Full setup pipeline — order matters
-FULL_SETUP_PIPELINE = [
-    "package",
-    "security",
-    "firewall",
-    "user",
-    "ssh",
-    "nginx",
-    "docker",
-    "pm2",
-]
+@dataclass
+class SetupContext:
+    tasks:           List[str]
+    infra_services:  List[str]
+    extra_packages:  List[str]
+    extra_commands:  List[str]
+    firewall_ports:  List[str]
+    open_ports:      List[str]
+    suggestions:     List[str] = field(default_factory=list)
+    server_purpose:  str = ""
+    new_username:    str = ""   # used by bootstrap_user task
 
-FULL_SETUP_KEYWORDS = ["setup", "full setup", "initialise", "initialize", "bootstrap", "provision", "configure server", "set up server"]
 
+# ── LLM gather prompt ──────────────────────────────────────────────────────────
+
+_GATHER_SYSTEM = """You are a server setup assistant.
+Your ONLY job: extract what the user wants to set up and return JSON.
+
+Available setup tasks:
+  base             - apt update/upgrade + essential tools (curl, git, wget, unzip, build-essential)
+  nginx            - install and start Nginx web server
+  docker           - install and start Docker
+  nodejs           - install Node.js and npm
+  pm2              - install PM2 process manager (requires nodejs)
+  python           - install Python3, pip, venv
+  firewall         - configure UFW (deny all, allow SSH/80/443 as relevant + custom ports)
+  fail2ban         - SSH brute-force protection
+  ssh_harden       - disable root SSH login, disable password auth, set MaxAuthTries (key-only login)
+  bootstrap_user   - create a new sudo user with SSH key access (run when connected as root on a fresh server)
+  auto_updates     - enable unattended-upgrades for automatic security patches
+
+Infrastructure services (run as shared Docker containers — one per server):
+  redis      - Redis cache server (port 6379) — shared by all apps
+  postgres   - PostgreSQL database (port 5432) — shared by all apps, each app uses different DB name
+  mysql      - MySQL database (port 3306)
+  mongodb    - MongoDB (port 27017)
+
+JSON fields:
+  tasks          - array of task names from the list above
+  infra_services - array of infrastructure services: ["redis", "postgres", "mysql", "mongodb"]
+  extra_packages - array of additional apt packages to install (e.g. ["htop", "vim"])
+  extra_commands - array of custom shell commands to run after setup
+  firewall_ports - array of port numbers to open in UFW (e.g. ["3000", "8080"]) — ONLY if explicitly requested
+  server_purpose - short description of what this server is for
+  new_username   - if user wants a new sudo user created (bootstrap_user task), the desired username; else ""
+  suggestions    - array of strings: things the user likely needs but didn't mention
+                   Examples:
+                   - "pm2 not included — required to keep Node.js apps running after reboot"
+                   - "fail2ban not included — recommended to protect SSH from brute-force attacks"
+                   - "docker not included but redis/postgres requested — docker is required to run infra containers"
+                   - "firewall not included — recommended to block unused ports"
+                   - "ssh_harden not included — recommended to disable root login and password auth"
+                   - "auto_updates not included — recommended so the server keeps patching itself"
+                   - "if connecting as root on a fresh server, consider bootstrap_user to create a sudo user before hardening SSH"
+                   Only suggest things that are genuinely missing and useful. Keep suggestions concise.
+
+Rules:
+- If user mentions redis/postgres/mysql/mongodb: put in infra_services (NOT extra_packages)
+- infra_services always require docker task to be included
+- If user mentions "root", "fresh server", or "create a user": include bootstrap_user and ask for new_username if not given
+- If user says "full setup": include all tasks + common infra (redis, postgres)
+- NEVER guess firewall_ports unless user explicitly mentions them
+- bootstrap_user should run BEFORE ssh_harden in practice (handled by execution order, not by you)
+- Return ONLY valid JSON
+
+Examples:
+
+User: "setup a fresh server as root, create a sudo user called deploy, then harden it"
+Response: {"tasks":["base","bootstrap_user","ssh_harden","fail2ban","firewall","auto_updates"],"infra_services":[],"extra_packages":[],"extra_commands":[],"firewall_ports":[],"server_purpose":"hardened fresh server","new_username":"deploy"}
+
+User: "setup a web server with nginx and docker"
+Response: {"tasks":["base","nginx","docker","firewall"],"infra_services":[],"extra_packages":[],"extra_commands":[],"firewall_ports":[],"server_purpose":"web server","new_username":""}
+
+User: "full server setup with nodejs pm2 and redis"
+Response: {"tasks":["base","nginx","nodejs","pm2","docker","firewall","fail2ban","ssh_harden","auto_updates"],"infra_services":["redis"],"extra_packages":[],"extra_commands":[],"firewall_ports":[],"server_purpose":"Node.js app server with Redis","new_username":""}
+
+User: "setup server with postgres and redis for python backend"
+Response: {"tasks":["base","python","docker","firewall"],"infra_services":["redis","postgres"],"extra_packages":[],"extra_commands":[],"firewall_ports":[],"server_purpose":"Python backend with Redis and Postgres","new_username":""}
+
+User: "missing something"
+Response: {"missing":true,"question":"What would you like to set up? E.g. web server (nginx), Node.js app, Python app, Docker, Redis, Postgres, full setup, fresh server bootstrap, etc."}
+"""
+
+
+# ── Agent ──────────────────────────────────────────────────────────────────────
 
 class SetupAgent:
-    """
-    LangGraph-based server setup agent with batched tool execution.
 
-    - For targeted queries (e.g. "install nginx"): routes to the matching
-      batch and runs only those tools.
-    - For full setup queries (e.g. "set up the server"): runs ALL batches
-      sequentially, one at a time, so Groq never sees more than ~10 tools.
-    """
-
-    def __init__(self, executor_type: str = "local", executor_config: Dict[str, Any] = None):
+    def __init__(
+        self,
+        executor_type:   str = "local",
+        executor_config: Dict[str, Any] = None,
+        server_label:    Optional[str] = None,
+    ):
         if executor_config is None:
             executor_config = {}
 
-        self.executor = ExecutorFactory.get_executor(executor_type, **executor_config)
-        self.llm = get_llm()
+        self.executor     = ExecutorFactory.get_executor(executor_type, **executor_config)
+        self.llm          = get_llm()
+        self.alerter      = TeamsAlerter()
+        self.server_label = server_label or executor_config.get("host", "unknown")
 
-        # ── Tool instances ────────────────────────────────────────────────────
-        pkg = PackageTool(self.executor)
-        fw  = FirewallTool(self.executor)
-        usr = UserTool(self.executor)
-        sec = SecurityTool(self.executor)
-        nx  = NginxTool(self.executor)
-        ssh = SSHTool(self.executor)
-        svc = SystemdTool(self.executor)
-        lx  = LinuxTool(self.executor)
-        mon = MonitoringTool(self.executor)
-        log = LogTool(self.executor)
-        dkr = DockerTool(self.executor)
-        pm2 = PM2Tool(self.executor)
+        # Tool instances
+        self.linux    = LinuxTool(self.executor)
+        self.pkg      = PackageTool(self.executor)
+        self.nginx    = NginxTool(self.executor)
+        self.firewall = FirewallTool(self.executor)
+        self.security = SecurityTool(self.executor)
+        self.docker   = DockerTool(self.executor)
+        self.pm2      = PM2Tool(self.executor)
+        self.ssh_tool = SSHTool(self.executor)
 
-        # ── Common tools included in every batch ──────────────────────────────
-        self._common = [
-            StructuredTool.from_function(
-                func=lx.run_custom_command,
-                name="run_command",
-                description="Run any shell command. Args: command (str).",
-            ),
-            StructuredTool.from_function(
-                func=lx.get_os_info,
-                name="get_os_info",
-                description="Get Linux distro info from /etc/os-release.",
-            ),
-            StructuredTool.from_function(
-                func=lx.change_permissions,
-                name="change_permissions",
-                description="chmod a path. Args: path (str), permissions (str).",
-            ),
-            StructuredTool.from_function(
-                func=lx.change_owner,
-                name="change_owner",
-                description="chown a path. Args: path (str), owner (str), group (str).",
-            ),
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _run(self, cmd: str) -> str:
+        logger.info(f"  [RUN] {cmd[:160]}")
+        result = self.linux.run_custom_command(cmd)
+        logger.info(f"  [OK]  {str(result)[:120]}")
+        return result
+
+    def _exec(self, cmd: str):
+        _, out, err = self.executor.execute(cmd)
+        return out.strip(), err.strip()
+
+    def _generate_password(self, length: int = 24) -> str:
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(length))
+
+    # ── Phase 1: gather via ONE LLM call ──────────────────────────────────────
+
+    def _gather_context(self, query: str) -> SetupContext:
+        """One LLM call to understand what the user wants, then ask for extras."""
+
+        messages = [
+            SystemMessage(content=_GATHER_SYSTEM),
+            HumanMessage(content=query),
         ]
 
-        # ── Tool batches ──────────────────────────────────────────────────────
-        self._batches: Dict[str, List[StructuredTool]] = {
+        while True:
+            time.sleep(1)
+            response = self.llm.invoke(messages)
+            raw = response.content.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
 
-            "package": [
-                StructuredTool.from_function(func=pkg.update_lists,  name="update_package_lists", description="Run apt-get update."),
-                StructuredTool.from_function(func=pkg.install,        name="install_package",      description="Install apt package. Args: package_name (str)."),
-                StructuredTool.from_function(func=pkg.remove,         name="remove_package",       description="Remove apt package. Args: package_name (str)."),
-                StructuredTool.from_function(func=pkg.is_installed,   name="is_package_installed", description="Check if apt package installed. Args: package_name (str)."),
-            ],
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                messages.append(response)
+                messages.append(HumanMessage(content="Return valid JSON only."))
+                continue
 
-            "firewall": [
-                StructuredTool.from_function(func=fw.enable,     name="enable_firewall",  description="Enable UFW firewall."),
-                StructuredTool.from_function(func=fw.disable,    name="disable_firewall", description="Disable UFW firewall."),
-                StructuredTool.from_function(func=fw.allow_port, name="allow_port",       description="Allow a port. Args: port (str), protocol (str)."),
-                StructuredTool.from_function(func=fw.deny_port,  name="deny_port",        description="Deny a port. Args: port (str), protocol (str)."),
-                StructuredTool.from_function(func=fw.status,     name="firewall_status",  description="Get UFW status."),
-            ],
+            # LLM needs more info
+            if data.get("missing"):
+                print(f"\n[?] {data.get('question', 'What would you like to set up?')}")
+                answer = input("    Your answer: ").strip()
+                messages.append(response)
+                messages.append(HumanMessage(content=answer))
+                continue
 
-            "user": [
-                StructuredTool.from_function(func=usr.create_user,  name="create_user",       description="Create Linux user. Args: username (str)."),
-                StructuredTool.from_function(func=usr.delete_user,  name="delete_user",       description="Delete Linux user. Args: username (str)."),
-                StructuredTool.from_function(func=usr.add_to_group, name="add_user_to_group", description="Add user to group. Args: username (str), group (str)."),
-            ],
+            # Got the plan — show it to the user
+            ctx = SetupContext(
+                tasks          = data.get("tasks", []),
+                infra_services = data.get("infra_services", []),
+                extra_packages = data.get("extra_packages", []),
+                extra_commands = data.get("extra_commands", []),
+                firewall_ports = data.get("firewall_ports", []),
+                open_ports     = data.get("firewall_ports", []),
+                suggestions    = data.get("suggestions", []),
+                server_purpose = data.get("server_purpose", ""),
+                new_username   = data.get("new_username", ""),
+            )
 
-            "security": [
-                StructuredTool.from_function(func=sec.install_fail2ban,       name="install_fail2ban",       description="Install and enable fail2ban."),
-                StructuredTool.from_function(func=sec.disable_root_ssh_login, name="disable_root_ssh_login", description="Disable root SSH login in sshd_config."),
-            ],
+            # If infra services need docker, ensure docker is in tasks
+            if ctx.infra_services and "docker" not in ctx.tasks:
+                ctx.tasks.insert(0, "docker")
 
-            "nginx": [
-                StructuredTool.from_function(func=nx.install,                  name="install_nginx",       description="Install Nginx via apt."),
-                StructuredTool.from_function(func=nx.start,                    name="start_nginx",         description="Start and enable Nginx."),
-                StructuredTool.from_function(func=nx.stop,                     name="stop_nginx",          description="Stop Nginx."),
-                StructuredTool.from_function(func=nx.restart,                  name="restart_nginx",       description="Restart Nginx."),
-                StructuredTool.from_function(func=nx.reload_nginx,             name="reload_nginx",        description="Reload Nginx config."),
-                StructuredTool.from_function(func=nx.generate_and_save_config, name="nginx_save_config",   description="Generate and save Nginx site config. Args: framework (str), domain (str), app_name (str), app_path (str), port (int)."),
-                StructuredTool.from_function(func=nx.enable_site,              name="nginx_enable_site",   description="Enable Nginx site. Args: app_name (str)."),
-                StructuredTool.from_function(func=nx.disable_site,             name="nginx_disable_site",  description="Disable Nginx site. Args: app_name (str)."),
-                StructuredTool.from_function(func=nx.test_config,              name="nginx_test_config",   description="Test Nginx config syntax."),
-                StructuredTool.from_function(func=nx.delete_site,              name="nginx_delete_site",   description="Delete Nginx site config. Args: app_name (str)."),
-                StructuredTool.from_function(func=nx.ensure_ws_map,            name="nginx_ensure_ws_map", description="Ensure WebSocket upgrade map in nginx.conf."),
-            ],
+            # bootstrap_user requested but no username given — ask
+            if "bootstrap_user" in ctx.tasks and not ctx.new_username:
+                username = input("\n[?] What username should the new sudo user have? ").strip()
+                ctx.new_username = username or "deploy"
 
-            "ssh": [
-                StructuredTool.from_function(func=ssh.generate_keypair,   name="generate_ssh_keypair", description="Generate Ed25519 SSH keypair. Args: email (str)."),
-                StructuredTool.from_function(func=ssh.get_public_key,     name="get_ssh_public_key",   description="Get server public SSH key."),
-                StructuredTool.from_function(func=ssh.add_authorized_key, name="add_authorized_key",   description="Add public key to authorized_keys. Args: public_key (str)."),
-            ],
+            # ── Show suggestions (things user may have missed) ─────────────
+            suggestions = data.get("suggestions", [])
+            if suggestions:
+                print("\n" + "─" * 60)
+                print("  💡 Suggestions — you might also need:")
+                print("─" * 60)
+                for i, s in enumerate(suggestions, 1):
+                    print(f"  {i}. {s}")
+                accept = input(
+                    "\n[?] Accept all suggestions? (yes/no/partial)\n"
+                    "    yes = add all  |  no = skip  |  partial = enter numbers (e.g. 1,3): "
+                ).strip().lower()
 
-            "systemd": [
-                StructuredTool.from_function(func=svc.create_service_file, name="create_systemd_service", description="Create systemd unit file. Args: service_name (str), exec_start (str), working_directory (str), description (str), user (str), restart_policy (str)."),
-                StructuredTool.from_function(func=svc.start_service,       name="start_service",          description="Start systemd service. Args: service_name (str)."),
-                StructuredTool.from_function(func=svc.stop_service,        name="stop_service",           description="Stop systemd service. Args: service_name (str)."),
-                StructuredTool.from_function(func=svc.restart_service,     name="restart_service",        description="Restart systemd service. Args: service_name (str)."),
-                StructuredTool.from_function(func=svc.enable_service,      name="enable_service",         description="Enable systemd service on boot. Args: service_name (str)."),
-                StructuredTool.from_function(func=svc.check_status,        name="service_status",         description="Get systemd service status. Args: service_name (str)."),
-            ],
+                if accept == "yes":
+                    # Re-ask LLM to merge suggestions into the plan
+                    messages.append(response)
+                    messages.append(HumanMessage(
+                        content="Accept all suggestions and add them to the plan. Return updated JSON."
+                    ))
+                    continue
+                elif accept not in ("no", ""):
+                    # Partial — user entered numbers
+                    chosen = [int(x.strip()) - 1 for x in accept.split(",") if x.strip().isdigit()]
+                    chosen_text = ". ".join(suggestions[i] for i in chosen if i < len(suggestions))
+                    if chosen_text:
+                        messages.append(response)
+                        messages.append(HumanMessage(
+                            content=f"Add these to the plan: {chosen_text}. Return updated JSON."
+                        ))
+                        continue
 
-            "monitor": [
-                StructuredTool.from_function(func=mon.get_cpu_usage,  name="get_cpu_usage",  description="Get CPU usage snapshot."),
-                StructuredTool.from_function(func=mon.get_ram_usage,  name="get_ram_usage",  description="Get RAM usage."),
-                StructuredTool.from_function(func=mon.get_disk_usage, name="get_disk_usage", description="Get disk usage."),
-            ],
+            # ── Show the plan ──────────────────────────────────────────────
+            print("\n" + "─" * 60)
+            print(f"  Setup Plan — {ctx.server_purpose or 'Server Setup'}")
+            print("─" * 60)
+            print(f"  Tasks:     {', '.join(ctx.tasks) or 'none'}")
+            if ctx.new_username:
+                print(f"  New user:  {ctx.new_username} (sudo)")
+            if ctx.infra_services:
+                print(f"  Infra:     {', '.join(ctx.infra_services)} (shared Docker containers)")
+            if ctx.extra_packages:
+                print(f"  Packages:  {', '.join(ctx.extra_packages)}")
+            if ctx.firewall_ports:
+                print(f"  Ports:     {', '.join(ctx.firewall_ports)}")
+            if ctx.extra_commands:
+                print(f"  Commands: {len(ctx.extra_commands)} custom command(s)")
 
-            "log": [
-                StructuredTool.from_function(func=log.read_syslog,     name="read_syslog",     description="Read syslog tail. Args: lines (int)."),
-                StructuredTool.from_function(func=log.read_journalctl, name="read_journalctl", description="Read service journal. Args: service (str), lines (int)."),
-                StructuredTool.from_function(func=log.read_file_tail,  name="read_log_file",   description="Read any log file tail. Args: filepath (str), lines (int)."),
-            ],
+            # ── Ask for extras ─────────────────────────────────────────────
+            print()
+            extra = input(
+                "[?] Anything else to add? (e.g. 'also install postgresql and open port 5432')\n"
+                "    Press Enter to skip: "
+            ).strip()
 
-            "docker": [
-                StructuredTool.from_function(func=dkr.is_installed,  name="is_docker_installed", description="Check if Docker is installed."),
-                StructuredTool.from_function(func=dkr.install,       name="install_docker",      description="Install Docker via get.docker.com."),
-                StructuredTool.from_function(func=dkr.start_service, name="start_docker",        description="Start and enable Docker service."),
-                StructuredTool.from_function(func=dkr.check_status,  name="docker_status",       description="Get Docker service status."),
-            ],
+            if extra:
+                # One more LLM call to parse the extras
+                messages.append(response)
+                messages.append(HumanMessage(
+                    content=f"Add these to the plan: {extra}. Return updated JSON."
+                ))
+                continue
 
-            "pm2": [
-                StructuredTool.from_function(func=pm2.install,       name="pm2_install",  description="Install PM2 globally via npm."),
-                StructuredTool.from_function(func=pm2.start,         name="pm2_start",    description="Start app with PM2. Args: app_name (str), script (str), working_directory (str)."),
-                StructuredTool.from_function(func=pm2.stop,          name="pm2_stop",     description="Stop PM2 process. Args: app_name (str)."),
-                StructuredTool.from_function(func=pm2.restart,       name="pm2_restart",  description="Restart PM2 process. Args: app_name (str)."),
-                StructuredTool.from_function(func=pm2.delete,        name="pm2_delete",   description="Delete PM2 process. Args: app_name (str)."),
-                StructuredTool.from_function(func=pm2.status,        name="pm2_status",   description="List all PM2 processes."),
-                StructuredTool.from_function(func=pm2.save,          name="pm2_save",     description="Save PM2 process list for reboots."),
-                StructuredTool.from_function(func=pm2.setup_startup, name="pm2_startup",  description="Configure PM2 auto-start on boot."),
-                StructuredTool.from_function(func=pm2.logs,          name="pm2_logs",     description="Get PM2 process logs. Args: app_name (str), lines (int)."),
-            ],
+            # ── Confirm ────────────────────────────────────────────────────
+            confirm = input("\n[?] Proceed with this setup? (yes/no): ").strip().lower()
+            if not confirm.startswith("y"):
+                print("Setup cancelled.")
+                raise SystemExit(0)
+
+            # Save context
+            self._save_context(ctx)
+            return ctx
+
+    def _save_context(self, ctx: SetupContext):
+        data = {
+            "tasks":          ctx.tasks,
+            "infra_services": ctx.infra_services,
+            "extra_packages": ctx.extra_packages,
+            "extra_commands": ctx.extra_commands,
+            "firewall_ports": ctx.firewall_ports,
+            "server_purpose": ctx.server_purpose,
+            "new_username":   ctx.new_username,
+        }
+        with open("setup_context.json", "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info("[SETUP] Context saved to setup_context.json")
+
+    # ── Phase 2: execute steps directly ───────────────────────────────────────
+
+    def _do_base(self):
+        logger.info("[SETUP] Base packages")
+        self._run("sudo apt-get update -y")
+        self._run("sudo apt-get upgrade -y")
+        self._run("sudo apt-get install -y curl git wget unzip build-essential software-properties-common")
+
+    def _do_nginx(self):
+        logger.info("[SETUP] Nginx")
+        self.nginx.install()
+        self.nginx.start()
+
+    def _do_docker(self):
+        logger.info("[SETUP] Docker")
+        self.docker.install()
+        self.docker.start_service()
+
+    def _do_nodejs(self):
+        logger.info("[SETUP] Node.js")
+        # Install NodeSource LTS
+        self._run("curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -")
+        self._run("sudo apt-get install -y nodejs")
+
+    def _do_pm2(self):
+        logger.info("[SETUP] PM2")
+        self.pm2.install()
+
+    def _do_python(self):
+        logger.info("[SETUP] Python")
+        self._run("sudo apt-get install -y python3 python3-pip python3-venv")
+
+    def _do_firewall(self, ctx: SetupContext):
+        """
+        Dynamic firewall setup:
+          - Detects the ACTUAL ssh port in use (instead of assuming 22)
+          - Only opens 80/443 if nginx is part of this setup
+          - Only opens infra service ports if those services were requested
+            (note: infra containers are bound to 127.0.0.1 only, so this is
+             defense-in-depth, not strictly required for them to work)
+          - Adds any explicitly requested firewall_ports from the user
+        """
+        logger.info("[SETUP] Firewall")
+
+        out, _ = self._exec(
+            "sudo grep -E '^Port ' /etc/ssh/sshd_config | awk '{print $2}'"
+        )
+        ssh_port = out.strip() or "22"
+
+        self.executor.execute("sudo ufw --force reset")
+        self.executor.execute("sudo ufw default deny incoming")
+        self.executor.execute("sudo ufw default allow outgoing")
+
+        ports_to_open = {ssh_port}
+
+        if "nginx" in ctx.tasks:
+            ports_to_open.update(["80", "443"])
+
+        infra_ports = {"redis": "6379", "postgres": "5432", "mysql": "3306", "mongodb": "27017"}
+        for svc in ctx.infra_services:
+            if svc.lower() in infra_ports:
+                ports_to_open.add(infra_ports[svc.lower()])
+
+        ports_to_open.update(ctx.firewall_ports)
+
+        for port in ports_to_open:
+            self.firewall.allow_port(port)
+
+        self.firewall.enable()
+
+    def _do_fail2ban(self):
+        logger.info("[SETUP] Fail2ban")
+        self.security.install_fail2ban()
+
+    def _do_ssh_harden(self):
+        logger.info("[SETUP] SSH hardening")
+        self.security.harden_ssh(max_auth_tries=3, disable_password_auth=True)
+
+    def _do_bootstrap_user(self, username: str):
+        """
+        Must run BEFORE ssh_harden. Creates a new sudo user, generates an SSH
+        keypair LOCALLY (private key never touches the remote server), and
+        installs only the public key on the remote authorized_keys.
+        """
+        logger.info(f"[SETUP] Bootstrapping sudo user: {username}")
+
+        key_info = self.ssh_tool.generate_local_keypair(
+            key_name=f"{username}_{self.server_label}",
+        )
+
+        self.security.bootstrap_sudo_user(username, key_info["public_key"])
+
+        logger.warning(
+            f"[SETUP] User '{username}' created on {self.server_label}.\n"
+            f"  Private key reference: {key_info['private_key_reference']}\n"
+            f"  This is the ONLY way to log in as '{username}' once root/password login is disabled."
+        )
+
+        return key_info
+
+    def _do_auto_updates(self):
+        logger.info("[SETUP] Automatic security updates")
+        self.security.enable_unattended_upgrades()
+
+    def _do_extra_packages(self, packages: List[str]):
+        for pkg in packages:
+            logger.info(f"[SETUP] Installing extra package: {pkg}")
+            self.pkg.install(pkg)
+
+    def _do_extra_commands(self, commands: List[str]):
+        for cmd in commands:
+            logger.info(f"[SETUP] Running custom command: {cmd}")
+            self._run(cmd)
+
+    def _do_infra(self, services: List[str]) -> Dict[str, Any]:
+        """
+        Runs requested infra services as Docker containers, bound to 127.0.0.1
+        only (never exposed externally — nginx/app code talks to them over
+        localhost). Credentials are generated randomly and saved via the key
+        storage backend, never hardcoded or printed in plaintext to logs.
+        """
+        infra_definitions = {
+            "redis": {
+                "image": "redis:7-alpine",
+                "container_name": "infra_redis",
+                "internal_port": "6379",
+            },
+            "postgres": {
+                "image": "postgres:16-alpine",
+                "container_name": "infra_postgres",
+                "internal_port": "5432",
+                "env_template": lambda pw: {"POSTGRES_PASSWORD": pw, "POSTGRES_USER": "postgres"},
+                "volume": "/var/lib/infra_postgres_data",
+                "volume_target": "/var/lib/postgresql/data",
+            },
+            "mysql": {
+                "image": "mysql:8",
+                "container_name": "infra_mysql",
+                "internal_port": "3306",
+                "env_template": lambda pw: {"MYSQL_ROOT_PASSWORD": pw},
+                "volume": "/var/lib/infra_mysql_data",
+                "volume_target": "/var/lib/mysql",
+            },
+            "mongodb": {
+                "image": "mongo:7",
+                "container_name": "infra_mongodb",
+                "internal_port": "27017",
+                "env_template": lambda pw: {
+                    "MONGO_INITDB_ROOT_USERNAME": "root",
+                    "MONGO_INITDB_ROOT_PASSWORD": pw,
+                },
+                "volume": "/var/lib/infra_mongodb_data",
+                "volume_target": "/data/db",
+            },
         }
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        connection_info: Dict[str, Any] = {}
 
-    def _is_full_setup(self, query: str) -> bool:
-        q = query.lower()
-        return any(kw in q for kw in FULL_SETUP_KEYWORDS)
+        for svc in services:
+            svc = svc.lower()
+            if svc not in infra_definitions:
+                logger.warning(f"[SETUP] Unknown infra service requested: {svc}")
+                continue
 
-    def _select_batches(self, query: str) -> List[str]:
-        """Return list of batch names matched by query keywords."""
-        q = query.lower()
-        matched = []
-        for keywords, batch_name in _ROUTES:
-            if any(kw in q for kw in keywords):
-                if batch_name not in matched:
-                    matched.append(batch_name)
-        # Always include package — most tasks need apt
-        if "package" not in matched:
-            matched.insert(0, "package")
-        return matched
+            definition = infra_definitions[svc]
+            port = definition["internal_port"]
 
-    def _run_batch(self, batch_name: str, query: str) -> str:
-        """Run a single batch agent for the given query."""
-        tools = self._common + self._batches[batch_name]
-        prompt = BATCH_PROMPTS.get(batch_name, "You are a Linux sysadmin. Complete the task using your tools.")
-        agent = create_react_agent(self.llm, tools, prompt=prompt)
-        result = agent.invoke({"messages": [("user", query)]})
-        return result["messages"][-1].content
+            # Bind only to localhost — nginx/app code connects via 127.0.0.1, never external
+            ports = {f"127.0.0.1:{port}": port}
 
-    # ── Public API ────────────────────────────────────────────────────────────
+            env = {}
+            password = None
+            if "env_template" in definition:
+                password = self._generate_password()
+                env = definition["env_template"](password)
+
+            volumes = {}
+            if "volume" in definition:
+                volumes = {definition["volume"]: definition["volume_target"]}
+
+            self.docker.run_container(
+                name=definition["container_name"],
+                image=definition["image"],
+                ports=ports,
+                env=env,
+                volumes=volumes,
+            )
+
+            if password:
+                ref = self.ssh_tool.key_storage.store_private_key(
+                    f"infra_{svc}_{self.server_label}_password", password
+                )
+                connection_info[svc] = {"port": port, "credential_reference": ref}
+                logger.warning(
+                    f"[SETUP] {svc} credential generated and stored at: {ref} "
+                    f"(not printed in plaintext)."
+                )
+            else:
+                connection_info[svc] = {"port": port}
+
+        return connection_info
+
+    # ── Public entry point ─────────────────────────────────────────────────────
 
     def execute_task(self, query: str) -> str:
-        """
-        Targeted query  → runs only the matching batch(es).
-        Full setup query → runs all batches in pipeline order, one by one.
-        """
-        if self._is_full_setup(query):
-            return self._run_full_setup(query)
-        else:
-            return self._run_targeted(query)
+        logger.info("[SETUP] Phase 1 — gathering setup requirements via LLM...")
+        ctx = self._gather_context(query)
 
-    def _run_targeted(self, query: str) -> str:
-        """Route to matched batches and run each one."""
-        batch_names = self._select_batches(query)
+        logger.info(f"[SETUP] Phase 2 — executing {len(ctx.tasks)} tasks...")
         results = []
-        for batch_name in batch_names:
-            logger.info(f"[SetupAgent] Running batch: {batch_name}")
-            result = self._run_batch(batch_name, query)
-            results.append(f"[{batch_name.upper()}]\n{result}")
-        return "\n\n".join(results)
 
-    def _run_full_setup(self, query: str) -> str:
-        results = []
-        for batch_name in FULL_SETUP_PIPELINE:
-            logger.info(f"[SetupAgent] Full setup — running batch: {batch_name}")
-            sub_query = f"Focus only on {batch_name} tasks. Do the standard {batch_name} setup now."
+        # Enforce safe ordering: bootstrap_user must run before ssh_harden,
+        # and ssh_harden/firewall should run near the end (after everything
+        # else is installed) so a config mistake doesn't block remaining steps.
+        order_priority = {
+            "bootstrap_user": 0,
+            "base": 1,
+            "docker": 2,
+            "nginx": 2,
+            "nodejs": 2,
+            "python": 2,
+            "pm2": 3,
+            "fail2ban": 4,
+            "auto_updates": 4,
+            "firewall": 5,
+            "ssh_harden": 6,  # last — riskiest step
+        }
+        ordered_tasks = sorted(ctx.tasks, key=lambda t: order_priority.get(t, 99))
+
+        simple_task_map = {
+            "base":         self._do_base,
+            "nginx":        self._do_nginx,
+            "docker":       self._do_docker,
+            "nodejs":       self._do_nodejs,
+            "pm2":          self._do_pm2,
+            "python":       self._do_python,
+            "fail2ban":     self._do_fail2ban,
+            "ssh_harden":   self._do_ssh_harden,
+            "auto_updates": self._do_auto_updates,
+        }
+
+        for task in ordered_tasks:
             try:
-                result = self._run_batch(batch_name, sub_query)
-                results.append(f"[{batch_name.upper()}] ✓\n{result}")
-                logger.info(f"[SetupAgent] Batch {batch_name} done.")
+                if task == "firewall":
+                    self._do_firewall(ctx)
+                elif task == "bootstrap_user":
+                    self._do_bootstrap_user(ctx.new_username or "deploy")
+                elif task in simple_task_map:
+                    simple_task_map[task]()
+                else:
+                    results.append(f"⚠ unknown task: {task}")
+                    continue
+                results.append(f"✓ {task}")
             except Exception as e:
-                error_msg = f"[{batch_name.upper()}] ✗ FAILED: {e}"
-                logger.error(error_msg)
-                results.append(error_msg)
-        return "\n\n" + "\n\n".join(results)
+                logger.error(f"[SETUP] {task} failed: {e}")
+                results.append(f"✗ {task}: {e}")
+                # If a risky step fails, stop the chain to avoid cascading damage
+                if task in ("ssh_harden", "bootstrap_user"):
+                    logger.error(f"[SETUP] Stopping further execution after critical failure in '{task}'")
+                    break
+
+        # Extra packages
+        if ctx.extra_packages:
+            try:
+                self._do_extra_packages(ctx.extra_packages)
+                results.append(f"✓ extra packages: {', '.join(ctx.extra_packages)}")
+            except Exception as e:
+                results.append(f"✗ extra packages: {e}")
+
+        # Infrastructure services (Redis, Postgres etc. as shared Docker containers)
+        if ctx.infra_services:
+            try:
+                connection_info = self._do_infra(ctx.infra_services)
+                results.append(f"✓ infra services: {', '.join(ctx.infra_services)}")
+                print("\n  Infrastructure connection info (localhost-only):")
+                for svc, info in connection_info.items():
+                    print(f"    {svc}: 127.0.0.1:{info['port']}")
+                    if "credential_reference" in info:
+                        print(f"      Credential stored securely at: {info['credential_reference']}")
+            except Exception as e:
+                results.append(f"✗ infra services: {e}")
+
+        # Extra commands
+        if ctx.extra_commands:
+            try:
+                self._do_extra_commands(ctx.extra_commands)
+                results.append(f"✓ custom commands: {len(ctx.extra_commands)} ran")
+            except Exception as e:
+                results.append(f"✗ custom commands: {e}")
+
+        summary = "\n".join(results)
+        failed  = [r for r in results if r.startswith("✗")]
+
+        if failed:
+            self.alerter.warning(
+                title="Server setup completed with errors",
+                server=self.server_label,
+                details="\n".join(failed),
+            )
+        else:
+            self.alerter.info(
+                title="Server setup completed successfully",
+                server=self.server_label,
+                details=f"Tasks: {', '.join(ctx.tasks)}",
+            )
+
+        return f"SETUP COMPLETE\n\n{summary}"
+
+    # ── Convenience: add a teammate's public key to an existing user ───────────
+
+    def add_team_member(self, public_key: str, home_dir: str = "/home/deploy") -> str:
+        """
+        Adds a teammate's PUBLIC key (never their private key) to the
+        authorized_keys of an existing user on this server. Call this using
+        an executor that is already authorized (e.g. your own key_filename),
+        not the original root/password credentials (which stop working after
+        ssh_harden runs).
+        """
+        return self.ssh_tool.add_authorized_key(public_key, home_dir=home_dir)

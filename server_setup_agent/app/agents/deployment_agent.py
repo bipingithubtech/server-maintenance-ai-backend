@@ -33,27 +33,27 @@ from app.tools.package_tool import PackageTool
 from app.tools.nginx_tool import NginxTool
 from app.tools.systemd_tool import SystemdTool
 from app.tools.pm2_tool import PM2Tool
+from app.services.teams_alert_service import TeamsAlerter
 
 
 # ── Deployment context ─────────────────────────────────────────────────────────
 
 @dataclass
 class DeploymentContext:
-    github_url : str
-    stack      : str
-    port       : str
-    domain     : str
-    env_vars   : Dict[str, str] = field(default_factory=dict)
+    github_url       : str
+    stack            : str
+    port             : str
+    domain           : str
+    env_vars         : Dict[str, str] = field(default_factory=dict)
+    process_manager  : str = ""   # pm2 | systemd | docker
 
     # Derived — filled automatically
     app_name   : str = ""
     app_path   : str = ""
 
     def __post_init__(self):
-        # Ensure .git suffix
         if not self.github_url.endswith(".git"):
             self.github_url += ".git"
-        # Derive app_name from repo slug
         repo = self.github_url.rstrip("/").split("/")[-1].replace(".git", "")
         self.app_name = repo.lower().replace("_", "-")
         self.app_path = f"/opt/{self.app_name}"
@@ -107,6 +107,8 @@ class DeploymentAgent:
         self.systemd  = SystemdTool(self.executor)
         self.pm2      = PM2Tool(self.executor)
         self.llm      = get_llm()
+        self.alerter  = TeamsAlerter()
+        self._server  = executor_config.get("host", "unknown")
 
     # ── Phase 1: gather context via LLM ───────────────────────────────────────
 
@@ -155,6 +157,29 @@ class DeploymentAgent:
                 domain     = data["domain"],
                 env_vars   = data.get("env_vars", {}),
             )
+
+            # ── Ask for process manager ────────────────────────────────────
+            stack = ctx.stack
+            if stack in ("react", "vite", "angular"):
+                # Static apps — no process manager needed
+                ctx.process_manager = "none"
+            else:
+                print("\n" + "─" * 60)
+                print("  Process Manager")
+                print("─" * 60)
+                if stack in ("fastapi", "flask", "django"):
+                    options = "pm2 | systemd | docker"
+                    default = "systemd"
+                else:
+                    options = "pm2 | systemd | docker"
+                    default = "pm2"
+                pm_answer = input(
+                    f"\n[?] How should the app be managed? ({options})\n"
+                    f"    Press Enter for default [{default}]: "
+                ).strip().lower()
+                ctx.process_manager = pm_answer if pm_answer in ("pm2", "systemd", "docker") else default
+                print(f"  Using: {ctx.process_manager}")
+                print("─" * 60)
 
             # ── Mandatory .env collection ──────────────────────────────────
             # Always ask — never skip unless user explicitly says no.
@@ -233,13 +258,14 @@ class DeploymentAgent:
     def _save_context(self, ctx: DeploymentContext) -> None:
         """Saves deployment context to deployment_context.json."""
         data = {
-            "github_url": ctx.github_url,
-            "stack":      ctx.stack,
-            "port":       ctx.port,
-            "domain":     ctx.domain,
-            "app_name":   ctx.app_name,
-            "app_path":   ctx.app_path,
-            "env_vars":   ctx.env_vars,
+            "github_url":      ctx.github_url,
+            "stack":           ctx.stack,
+            "port":            ctx.port,
+            "domain":          ctx.domain,
+            "app_name":        ctx.app_name,
+            "app_path":        ctx.app_path,
+            "env_vars":        ctx.env_vars,
+            "process_manager": ctx.process_manager,
         }
         with open("deployment_context.json", "w") as f:
             json.dump(data, f, indent=2)
@@ -319,58 +345,126 @@ class DeploymentAgent:
         return expected_port
 
     def _step_install(self, ctx: DeploymentContext) -> None:
-        logger.info(f"[STEP 3/5] Install ({ctx.stack})")
-        stack    = ctx.stack
+        logger.info(f"[STEP 3/5] Install ({ctx.stack} via {ctx.process_manager})")
+        stack = ctx.stack
         app_path = ctx.app_path
         app_name = ctx.app_name
         port     = ctx.port
+        pm       = ctx.process_manager
 
+        # ── Static (no process manager) ────────────────────────────────────
         if stack in ("react", "vite", "angular"):
             self.pkg.install("nodejs")
             self._run(f"npm install --prefix {app_path}")
             self._run(f"npm run build --prefix {app_path}")
+            return
 
-        elif stack == "nextjs":
+        # ── Node / Next.js / NestJS ────────────────────────────────────────
+        if stack in ("nextjs", "nodejs", "nestjs"):
             self.pkg.install("nodejs")
             self._run(f"npm install --prefix {app_path}")
-            self._run(f"npm run build --prefix {app_path}")
-            self.pm2.install()
-            self.pm2.start(app_name=app_name, script="npm", working_directory=app_path)
-            self.pm2.save()
-            ctx.port = self._detect_actual_port(app_name, ctx.port)
-
-        elif stack in ("nodejs", "nestjs"):
-            entry = "dist/main.js" if stack == "nestjs" else "index.js"
-            self.pkg.install("nodejs")
-            self._run(f"npm install --prefix {app_path}")
-            if stack == "nestjs":
+            if stack in ("nextjs", "nestjs"):
                 self._run(f"npm run build --prefix {app_path}")
-            self.pm2.install()
-            self.pm2.start(app_name=app_name, script=entry, working_directory=app_path)
-            self.pm2.save()
-            ctx.port = self._detect_actual_port(app_name, ctx.port)
+            entry = "npm" if stack == "nextjs" else ("dist/main.js" if stack == "nestjs" else "index.js")
 
+            if pm == "pm2":
+                self.pm2.install()
+                self.pm2.start(app_name=app_name, script=entry, working_directory=app_path)
+                self.pm2.save()
+                ctx.port = self._detect_actual_port(app_name, ctx.port)
+
+            elif pm == "systemd":
+                if stack == "nextjs":
+                    exec_start = f"/usr/bin/npm --prefix {app_path} run start"
+                else:
+                    exec_start = f"/usr/bin/node {app_path}/{entry}"
+                self.systemd.create_service_file(
+                    service_name=app_name,
+                    exec_start=exec_start,
+                    working_directory=app_path,
+                )
+                self.systemd.start_service(app_name)
+                self.systemd.enable_service(app_name)
+
+            elif pm == "docker":
+                self._deploy_docker(ctx)
+
+        # ── Python (fastapi / flask / django) ──────────────────────────────
         elif stack in ("fastapi", "flask", "django"):
             if not self._file_exists(f"{app_path}/requirements.txt"):
                 raise RuntimeError(f"No requirements.txt found at {app_path}.")
+
+            if pm == "docker":
+                self._deploy_docker(ctx)
+                return
+
+            # Install deps regardless of pm
             self.pkg.install("python3-venv")
             self._run(f"python3 -m venv {app_path}/venv")
             self._run(f"{app_path}/venv/bin/pip install -r {app_path}/requirements.txt")
+
             if stack == "fastapi":
-                exec_start = f"{app_path}/venv/bin/uvicorn main:app --host 0.0.0.0 --port {port}"
+                exec_cmd = f"{app_path}/venv/bin/uvicorn main:app --host 0.0.0.0 --port {port}"
             elif stack == "flask":
-                exec_start = f"{app_path}/venv/bin/python app.py"
+                exec_cmd = f"{app_path}/venv/bin/python app.py"
             else:
-                exec_start = f"{app_path}/venv/bin/python manage.py runserver 0.0.0.0:{port}"
-            self.systemd.create_service_file(
-                service_name=app_name,
-                exec_start=exec_start,
-                working_directory=app_path,
-            )
-            self.systemd.start_service(app_name)
-            self.systemd.enable_service(app_name)
+                exec_cmd = f"{app_path}/venv/bin/python manage.py runserver 0.0.0.0:{port}"
+
+            if pm == "pm2":
+                self.pm2.install()
+                # PM2 starts python via interpreter
+                self.pm2.start(
+                    app_name=app_name,
+                    script=exec_cmd.split()[0],   # the binary
+                    working_directory=app_path,
+                )
+                self.pm2.save()
+
+            else:  # systemd (default for Python)
+                self.systemd.create_service_file(
+                    service_name=app_name,
+                    exec_start=exec_cmd,
+                    working_directory=app_path,
+                )
+                self.systemd.start_service(app_name)
+                self.systemd.enable_service(app_name)
+
         else:
             raise RuntimeError(f"Unsupported stack: {stack}")
+
+    def _deploy_docker(self, ctx: DeploymentContext) -> None:
+        """Build and run app using Docker."""
+        logger.info(f"  [DOCKER] Building {ctx.app_name}")
+        # Check Dockerfile exists
+        if not self._file_exists(f"{ctx.app_path}/Dockerfile"):
+            raise RuntimeError(
+                f"No Dockerfile found at {ctx.app_path}. "
+                "Cannot deploy with Docker."
+            )
+        # Install Docker if needed
+        code, _, _ = self.executor.execute("which docker")
+        if code != 0:
+            self._run("sudo apt-get update -y && sudo apt-get install -y docker.io")
+            self._run("sudo systemctl start docker && sudo systemctl enable docker")
+            self._run(f"sudo usermod -aG docker $(whoami)")
+
+        # Stop existing container
+        self.executor.execute(f"docker stop {ctx.app_name} 2>/dev/null || true")
+        self.executor.execute(f"docker rm {ctx.app_name} 2>/dev/null || true")
+
+        # Build image
+        self._run(f"docker build -t {ctx.app_name} {ctx.app_path}")
+
+        # Run container
+        env_flags = " ".join(f"-e {k}={v}" for k, v in ctx.env_vars.items())
+        self._run(
+            f"docker run -d --name {ctx.app_name} "
+            f"--restart unless-stopped "
+            f"-p {ctx.port}:{ctx.port} "
+            f"{env_flags} "
+            f"{ctx.app_name}"
+        )
+        logger.info(f"  [DOCKER] Container {ctx.app_name} running on port {ctx.port}")
 
     def _check_port_conflict(self, port: str) -> None:
         """
@@ -411,96 +505,106 @@ class DeploymentAgent:
 
         logger.info(f"  [PORT] User chose to continue with port {port} despite conflict.")
         return port
-        """
-        After starting the app, detect the actual port it bound to.
-        Checks PM2 logs and ss -tlnp. Falls back to expected_port if not found.
-        """
-        import time as _time
-        _time.sleep(3)  # give the app time to start
 
-        # Check PM2 startup logs for "Running on Port: XXXX" or "listening on port XXXX"
+    def _detect_actual_port(self, app_name: str, expected_port: str) -> str:
+        """After PM2 start, read actual port from logs and ss."""
+        import time as _t
+        _t.sleep(3)
+
         _, logs, _ = self.executor.execute(
             f"pm2 logs {app_name} --lines 30 --nostream --no-color 2>/dev/null"
         )
-        port_match = re.search(
-            r'(?:port|PORT|listening)[^\d]*(\d{3,5})', logs, re.IGNORECASE
-        )
-        if port_match:
-            detected = port_match.group(1)
+        match = re.search(r'(?:port|PORT|listening)[^\d]*(\d{3,5})', logs, re.IGNORECASE)
+        if match:
+            detected = match.group(1)
             if detected != expected_port:
-                logger.warning(
-                    f"  [PORT] App reports port {detected}, "
-                    f"but you specified {expected_port}. Using {detected}."
-                )
+                logger.warning(f"  [PORT] App bound to {detected}, not {expected_port}. Using {detected}.")
             return detected
 
-        # Fallback: check ss -tlnp for node processes
         _, ss_out, _ = self.executor.execute("ss -tlnp | grep node")
-        ss_match = re.search(r':(\d{3,5})\s', ss_out)
-        if ss_match:
-            detected = ss_match.group(1)
+        match = re.search(r':(\d{3,5})\s', ss_out)
+        if match:
+            detected = match.group(1)
             if detected != expected_port:
-                logger.warning(
-                    f"  [PORT] ss shows node on port {detected}, "
-                    f"but you specified {expected_port}. Using {detected}."
-                )
+                logger.warning(f"  [PORT] ss shows node on {detected}, not {expected_port}. Using {detected}.")
             return detected
 
-        logger.info(f"  [PORT] Could not auto-detect port. Using specified: {expected_port}")
+        logger.info(f"  [PORT] Could not auto-detect. Using specified: {expected_port}")
         return expected_port
-        logger.info(f"[STEP 3/5] Install ({ctx.stack})")
+
+    def _step_install(self, ctx: DeploymentContext) -> None:
+        logger.info(f"[STEP 3/5] Install ({ctx.stack} via {ctx.process_manager})")
         stack    = ctx.stack
         app_path = ctx.app_path
         app_name = ctx.app_name
         port     = ctx.port
+        pm       = ctx.process_manager
 
         if stack in ("react", "vite", "angular"):
             self.pkg.install("nodejs")
             self._run(f"npm install --prefix {app_path}")
             self._run(f"npm run build --prefix {app_path}")
+            return
 
-        elif stack == "nextjs":
+        if stack in ("nextjs", "nodejs", "nestjs"):
             self.pkg.install("nodejs")
             self._run(f"npm install --prefix {app_path}")
-            self._run(f"npm run build --prefix {app_path}")
-            self.pm2.install()
-            self.pm2.start(app_name=app_name, script="npm", working_directory=app_path)
-            self.pm2.save()
-            ctx.port = self._detect_actual_port(app_name, ctx.port)
-
-        elif stack in ("nodejs", "nestjs"):
-            entry = "dist/main.js" if stack == "nestjs" else "index.js"
-            self.pkg.install("nodejs")
-            self._run(f"npm install --prefix {app_path}")
-            if stack == "nestjs":
+            if stack in ("nextjs", "nestjs"):
                 self._run(f"npm run build --prefix {app_path}")
-            self.pm2.install()
-            self.pm2.start(app_name=app_name, script=entry, working_directory=app_path)
-            self.pm2.save()
-            ctx.port = self._detect_actual_port(app_name, ctx.port)
+            entry = "npm" if stack == "nextjs" else ("dist/main.js" if stack == "nestjs" else "index.js")
+
+            if pm == "pm2":
+                self.pm2.install()
+                self.pm2.start(app_name=app_name, script=entry, working_directory=app_path)
+                self.pm2.save()
+                ctx.port = self._detect_actual_port(app_name, ctx.port)
+            elif pm == "systemd":
+                exec_start = (
+                    f"/usr/bin/npm --prefix {app_path} run start"
+                    if stack == "nextjs"
+                    else f"/usr/bin/node {app_path}/{entry}"
+                )
+                self.systemd.create_service_file(
+                    service_name=app_name,
+                    exec_start=exec_start,
+                    working_directory=app_path,
+                )
+                self.systemd.start_service(app_name)
+                self.systemd.enable_service(app_name)
+            elif pm == "docker":
+                self._deploy_docker(ctx)
 
         elif stack in ("fastapi", "flask", "django"):
             if not self._file_exists(f"{app_path}/requirements.txt"):
                 raise RuntimeError(f"No requirements.txt found at {app_path}.")
+
+            if pm == "docker":
+                self._deploy_docker(ctx)
+                return
+
             self.pkg.install("python3-venv")
             self._run(f"python3 -m venv {app_path}/venv")
             self._run(f"{app_path}/venv/bin/pip install -r {app_path}/requirements.txt")
-            if stack == "fastapi":
-                exec_start = f"{app_path}/venv/bin/uvicorn main:app --host 0.0.0.0 --port {port}"
-            elif stack == "flask":
-                exec_start = f"{app_path}/venv/bin/python app.py"
-            else:
-                exec_start = (
-                    f"{app_path}/venv/bin/python manage.py runserver 0.0.0.0:{port}"
-                )
-            self.systemd.create_service_file(
-                service_name=app_name,
-                exec_start=exec_start,
-                working_directory=app_path,
-            )
-            self.systemd.start_service(app_name)
-            self.systemd.enable_service(app_name)
 
+            if stack == "fastapi":
+                exec_cmd = f"{app_path}/venv/bin/uvicorn main:app --host 0.0.0.0 --port {port}"
+            elif stack == "flask":
+                exec_cmd = f"{app_path}/venv/bin/python app.py"
+            else:
+                exec_cmd = f"{app_path}/venv/bin/python manage.py runserver 0.0.0.0:{port}"
+
+            if pm == "pm2":
+                self.pm2.install()
+                self.pm2.start(app_name=app_name, script=exec_cmd.split()[0], working_directory=app_path)
+                self.pm2.save()
+            else:
+                self.systemd.create_service_file(
+                    service_name=app_name,
+                    exec_start=exec_cmd,
+                    working_directory=app_path,
+                )
+                self.systemd.start_service(app_name)
+                self.systemd.enable_service(app_name)
         else:
             raise RuntimeError(f"Unsupported stack: {stack}")
 
@@ -572,6 +676,11 @@ class DeploymentAgent:
             results.append("✓ clone")
         except Exception as e:
             logger.error(f"[STEP 1 FAILED] {e}")
+            self.alerter.critical(
+                title=f"Deployment FAILED: {ctx.app_name} — clone error",
+                server=self._server,
+                details=str(e)[:300],
+            )
             return f"DEPLOYMENT FAILED at clone.\n{e}"
 
         # ── Step 2: Write .env (only if vars collected) ────────────────────
@@ -581,6 +690,11 @@ class DeploymentAgent:
                 results.append(f"✓ env_file ({len(ctx.env_vars)} vars)")
             except Exception as e:
                 logger.error(f"[STEP 2 FAILED] {e}")
+                self.alerter.critical(
+                    title=f"Deployment FAILED: {ctx.app_name} — .env write error",
+                    server=self._server,
+                    details=str(e)[:300],
+                )
                 return f"DEPLOYMENT FAILED writing .env.\n{e}"
         else:
             results.append("- env_file: skipped")
@@ -588,9 +702,22 @@ class DeploymentAgent:
         # ── Step 3: Install + start process ───────────────────────────────
         try:
             self._step_install(ctx)
-            results.append(f"✓ install ({ctx.stack})")
+            results.append(f"✓ install ({ctx.stack} via {ctx.process_manager})")
         except Exception as e:
             logger.error(f"[STEP 3 FAILED] {e}")
+            err_str = str(e)
+            if "no space left" in err_str.lower() or "errno 28" in err_str.lower():
+                self.alerter.critical(
+                    title=f"Deployment FAILED: {ctx.app_name} — DISK FULL",
+                    server=self._server,
+                    details=f"Disk is full. Run MaintenanceAgent.clear_disk() to free space.\n{err_str[:200]}",
+                )
+            else:
+                self.alerter.critical(
+                    title=f"Deployment FAILED: {ctx.app_name} — install error",
+                    server=self._server,
+                    details=err_str[:300],
+                )
             return f"DEPLOYMENT FAILED at install.\n{e}"
 
         # ── Step 4: Nginx ──────────────────────────────────────────────────
@@ -599,13 +726,25 @@ class DeploymentAgent:
             results.append("✓ nginx")
         except Exception as e:
             logger.error(f"[STEP 4 FAILED] {e}")
+            self.alerter.critical(
+                title=f"Deployment FAILED: {ctx.app_name} — nginx error",
+                server=self._server,
+                details=str(e)[:300],
+            )
             return f"DEPLOYMENT FAILED at nginx.\n{e}"
 
+        # ── Success ────────────────────────────────────────────────────────
+        summary = "\n".join(results)
+        self.alerter.info(
+            title=f"Deployment SUCCESS: {ctx.app_name}",
+            server=self._server,
+            details=f"URL: http://{ctx.domain} | Port: {ctx.port} | Stack: {ctx.stack}",
+        )
         return (
             f"DEPLOYMENT COMPLETE\n"
             f"App:    {ctx.app_name}\n"
             f"URL:    http://{ctx.domain}\n"
             f"Port:   {ctx.port}\n"
             f"Stack:  {ctx.stack}\n\n"
-            + "\n".join(results)
+            + summary
         )

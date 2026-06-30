@@ -1,9 +1,10 @@
 {
-  "github_url": "https://github.com/Meetri-IT/luna-frontend.git",
-  "stack": "nextjs",
-  "port": "5001",
+  "github_url": "https://github.com/Meetri-IT/voice_ai_backend.git",
+  "stack": "fastapi",
+  "port": "8001",
   "domain": "192.168.56.101",
-  "app_name": "luna-frontend",
-  "app_path": "/opt/luna-frontend",
-  "env_vars": {}
+  "app_name": "voice-ai-backend",
+  "app_path": "/opt/voice-ai-backend",
+  "env_vars": {},
+  "process_manager": "docker"
 }

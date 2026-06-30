@@ -2,7 +2,7 @@
 
 # You can provide everything upfront or leave things out —
 # the agent will ask for whatever is missing.
-QUERY = "deploy https://github.com/Meetri-IT/luna-frontend.git stack is next js ip is 192.168.56.101"
+QUERY = "deploy https://github.com/Meetri-IT/voice_ai_backend.git stack=fastapi port=8001 domain=192.168.56.101"
 
 
 def main():

@@ -23,3 +23,6 @@ __pycache__/
 # OS Files
 .DS_Store
 Thumbs.db
+
+# Auto-added: never commit generated SSH keys
+generated_keys/

@@ -1,21 +1,24 @@
 ﻿from app.agents.setup_agent import SetupAgent
 
-def main():
-    agent = SetupAgent(
-        executor_type="ssh",
-        executor_config={
-            "host": "192.168.56.101",
-            "username": "bipin123",
-            "password": "bipin",
-            "port": 22
-        }
-    )
+agent = SetupAgent(
+    executor_type="ssh",
+    executor_config={
+        "host": "192.168.56.101",
+        "username": "bipin123",
+        "password": "bipin",
+        "port": 22,
+    },
+    server_label="aiagent-192.168.56.101",
+)
 
-    query = "setup the server"
+# Tell it what you want — it will show you a plan and ask for extras
+result = agent.execute_task(
+    "setup a web server with nginx, nodejs, pm2, docker, ssh_harden, fail2ban, and python"
+)
 
-    print(f"--- Sending query ---\n{query}\n")
-    response = agent.execute_task(query)
-    print(f"--- Agent response ---\n{response}\n")
 
-if __name__ == "__main__":
-    main()
+# Or for full setup:
+# result = agent.execute_task("full server setup")
+
+# Or minimal:
+# result = agent.execute_task("just install nginx and firewall")
