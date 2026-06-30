@@ -1,4 +1,5 @@
 import re
+from loguru import logger
 from app.executors.base_executor import BaseExecutor
 
 
@@ -28,18 +29,41 @@ class LinuxTool:
                     return f"Build skipped — dist/ already exists at {app_path}/dist with files: {check_out.strip()[:100]}"
         exit_code, stdout, stderr = self.executor.execute(command)
 
-        # Auto-recover: directory already exists — switch clone to pull
+        # Auto-recover: directory already exists — switch clone to plain git pull
         if exit_code != 0 and "already exists and is not an empty directory" in stderr:
-            match = re.search(r'git clone\s+\S+\s+(\S+)', command)
-            if match:
-                target_path = match.group(1)
-                pull_cmd = (
-                    'GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o StrictHostKeyChecking=no" '
-                    f'git -C {target_path} pull'
-                )
+            # Always take the last whitespace-separated token as the target path
+            # e.g. git clone https://$(cat ~/.github_token)@github.com/Org/repo.git /opt/myapp
+            #                                                                         ^^^^^^^^^^^
+            tokens = command.strip().split()
+            target_path = tokens[-1] if tokens else None
+            if target_path and target_path.startswith("/"):
+                pull_cmd = f"git -C {target_path} pull"
                 exit_code, stdout, stderr = self.executor.execute(pull_cmd)
 
-        # Auto-recover: npm ERESOLVE peer dependency conflict — retry with --legacy-peer-deps
+        # Auto-recover: pdfjs-dist canvas.node webpack error — patch next.config.mjs
+        if exit_code != 0 and "canvas.node" in stderr and "Module parse failed" in stderr:
+            prefix_match = re.search(r'--prefix\s+(\S+)', command)
+            app_path = prefix_match.group(1) if prefix_match else None
+            if app_path:
+                for config_file in ["next.config.mjs", "next.config.js", "next.config.ts"]:
+                    check_code, _, _ = self.executor.execute(f"test -f {app_path}/{config_file}")
+                    if check_code == 0:
+                        _, config_content, _ = self.executor.execute(f"cat {app_path}/{config_file}")
+                        # Only patch if canvas alias not already present
+                        if "canvas: false" not in config_content or "resolve.alias" not in config_content:
+                            # Inject alias line after the webpack function opening
+                            patched = config_content.replace(
+                                "config.resolve.fallback = {",
+                                "config.resolve.alias = { ...config.resolve.alias, canvas: false };\n    config.resolve.fallback = {",
+                                1  # only first occurrence
+                            )
+                            import base64 as _b64
+                            encoded = _b64.b64encode(patched.encode()).decode()
+                            write_cmd = f"echo '{encoded}' | base64 --decode > {app_path}/{config_file}"
+                            self.executor.execute(write_cmd)
+                            logger.info(f"Auto-patched {config_file} to fix canvas.node webpack error")
+                        exit_code, stdout, stderr = self.executor.execute(command)
+                        break
         if exit_code != 0 and "ERESOLVE" in stderr and "npm" in command:
             legacy_cmd = command.replace("npm install", "npm install --legacy-peer-deps")
             if legacy_cmd != command:
@@ -71,6 +95,18 @@ class LinuxTool:
                 exit_code, stdout, stderr = self.executor.execute(command)
 
         if exit_code != 0:
+            # npm writes ALL output (including warnings) to stderr.
+            # If every non-empty stderr line is just "npm warn", it's not a real error.
+            if "npm" in command:
+                real_errors = [
+                    l for l in stderr.splitlines()
+                    if l.strip() and not l.strip().startswith("npm warn")
+                    and not l.strip().startswith("npm notice")
+                ]
+                if not real_errors:
+                    logger.info(f"  npm completed with warnings only — treating as success")
+                    return stdout or "npm completed with deprecation warnings (not errors)."
+
             raise RuntimeError(f"Command failed:\nSTDOUT: {stdout}\nSTDERR: {stderr}")
 
         return stdout

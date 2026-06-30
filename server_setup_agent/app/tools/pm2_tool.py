@@ -12,11 +12,13 @@ class PM2Tool:
         self.executor = executor
 
     def install(self) -> str:
-        """Installs PM2 globally via npm."""
+        """Installs PM2 globally via npm and updates the daemon."""
         exit_code, out, err = self.executor.execute("sudo npm install -g pm2")
         if exit_code != 0:
             raise RuntimeError(f"Failed to install PM2:\n{err}")
-        logger.info("PM2 installed successfully.")
+        # Sync daemon version to avoid "in-memory PM2 is out-of-date" warning
+        self.executor.execute("pm2 update")
+        logger.info("PM2 installed and updated successfully.")
         return "PM2 installed successfully."
 
     def start(

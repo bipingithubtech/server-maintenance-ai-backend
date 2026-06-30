@@ -1,0 +1,9 @@
+{
+  "github_url": "https://github.com/Meetri-IT/luna-frontend.git",
+  "stack": "nextjs",
+  "port": "5001",
+  "domain": "192.168.56.101",
+  "app_name": "luna-frontend",
+  "app_path": "/opt/luna-frontend",
+  "env_vars": {}
+}

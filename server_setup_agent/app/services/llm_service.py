@@ -6,7 +6,6 @@ from langchain_core.outputs import ChatResult
 from loguru import logger
 from app.core.config import settings
 
-
 class RateLimitAwareChatGroq(ChatGroq):
     """
     ChatGroq subclass that automatically retries on 429 rate limit errors.
@@ -15,13 +14,33 @@ class RateLimitAwareChatGroq(ChatGroq):
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         max_retries = 5
+        current_messages = list(messages)
+
         for attempt in range(max_retries):
             try:
-                return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+                return super()._generate(current_messages, stop=stop, run_manager=run_manager, **kwargs)
             except Exception as e:
                 err_str = str(e)
+
+                # ── 400 tool_use_failed: Groq generated malformed tool XML ──
+                # This happens when conversation history is too long / complex.
+                # Fix: progressively trim middle messages and retry immediately.
+                if "400" in err_str and ("tool_use_failed" in err_str or "Failed to call a function" in err_str):
+                    if attempt < max_retries - 1:
+                        # Keep system + first user + last N messages, shrinking each retry
+                        keep_recent = max(2, 6 - attempt * 2)
+                        if len(current_messages) > keep_recent + 2:
+                            current_messages = current_messages[:2] + current_messages[-keep_recent:]
+                            logger.warning(
+                                f"Groq tool_use_failed (400). Trimming history to "
+                                f"{len(current_messages)} messages and retrying "
+                                f"(attempt {attempt + 1}/{max_retries})..."
+                            )
+                            continue
+                    raise
+
+                # ── 429 / rate limit ──────────────────────────────────────
                 if "429" in err_str or "413" in err_str or "rate_limit_exceeded" in err_str:
-                    # 413 = request too large — retrying won't help
                     if "413" in err_str or "Request too large" in err_str:
                         raise
                     wait_seconds = self._parse_wait_time(err_str)
@@ -67,6 +86,7 @@ def get_llm():
             api_key=settings.GROQ_API_KEY,
             model_name=settings.MODEL_NAME,
             temperature=settings.TEMPERATURE,
+        
         )
 
     raise ValueError(f"Unsupported provider: {settings.LLM_PROVIDER}")

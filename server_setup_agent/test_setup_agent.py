@@ -4,14 +4,14 @@ def main():
     agent = SetupAgent(
         executor_type="ssh",
         executor_config={
-            "host": "127.0.0.1",
+            "host": "192.168.56.101",
             "username": "bipin123",
             "password": "bipin",
-            "port": 2222
+            "port": 22
         }
     )
 
-    query = "Update the package lists, then tell me what you did. Do not install anything."
+    query = "setup the server"
 
     print(f"--- Sending query ---\n{query}\n")
     response = agent.execute_task(query)
