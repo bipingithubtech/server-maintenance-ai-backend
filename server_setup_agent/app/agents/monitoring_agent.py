@@ -378,7 +378,118 @@ class MonitoringAgent:
         all_services = pm2_services + systemd_services + docker_services
         return self._format_report(sys_health, all_services, security_issues)
 
-    def check_app(self, app_name: str) -> str:
+    def server_info(self) -> str:
+        """
+        Show full server configuration and all installed packages/services.
+        Answers: "show me what's installed", "server configuration", etc.
+        """
+        logger.info(f"[MONITOR] Server info scan on {self.server_label}")
+        lines = ["=" * 60, "  SERVER CONFIGURATION & INSTALLED SOFTWARE", "=" * 60]
+
+        # ── OS & Hardware ──────────────────────────────────────────
+        lines.append("\n── System ──────────────────────────────────────────────")
+        checks = [
+            ("OS",       "lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"'"),
+            ("Kernel",   "uname -r"),
+            ("Arch",     "uname -m"),
+            ("Hostname", "hostname"),
+            ("Uptime",   "uptime -p 2>/dev/null || uptime"),
+            ("CPU",      "nproc 2>/dev/null | awk '{print $0\" core(s)\"}'"),
+            ("RAM",      "free -h | awk '/^Mem:/{print $2\" total, \"$3\" used, \"$4\" free\"}'"),
+            ("Disk",     "df -h / | awk 'NR==2{print $2\" total, \"$3\" used (\"$5\"), \"$4\" free\"}'"),
+        ]
+        for label, cmd in checks:
+            out, _ = self._exec(cmd)
+            lines.append(f"  {label+':':<12} {out or 'n/a'}")
+
+        # ── Core packages ─────────────────────────────────────────
+        lines.append("\n── Core Packages ───────────────────────────────────────")
+        pkg_checks = [
+            ("curl",    "curl --version 2>/dev/null | head -1 | awk '{print $1,$2}'"),
+            ("git",     "git --version 2>/dev/null | awk '{print $3}'"),
+            ("wget",    "wget --version 2>/dev/null | head -1 | awk '{print $3}'"),
+            ("unzip",   "unzip -v 2>/dev/null | head -1 | awk '{print $2}'"),
+            ("Python3", "python3 --version 2>/dev/null | awk '{print $2}'"),
+            ("pip3",    "pip3 --version 2>/dev/null | awk '{print $2}'"),
+            ("Node.js", "node --version 2>/dev/null"),
+            ("npm",     "npm --version 2>/dev/null"),
+            ("PM2",     "pm2 --version 2>/dev/null"),
+            ("Nginx",   "nginx -v 2>&1 | awk -F/ '{print $2}'"),
+            ("Docker",  "docker --version 2>/dev/null | awk '{print $3}' | tr -d ','"),
+        ]
+        for label, cmd in pkg_checks:
+            out, _ = self._exec(cmd)
+            status = f"v{out}" if out and not out.startswith("v") else (out or "─ not installed")
+            lines.append(f"  {label+':':<12} {status}")
+
+        # ── Security / hardening ──────────────────────────────────
+        lines.append("\n── Security & Hardening ────────────────────────────────")
+        out, _ = self._exec("fail2ban-client --version 2>/dev/null | head -1 | awk '{print $2}'")
+        lines.append(f"  {'Fail2ban:':<12} {('v' + out) if out else '─ not installed'}")
+
+        out, _ = self._exec("sudo ufw status 2>/dev/null | head -1")
+        lines.append(f"  {'UFW:':<12} {out or '─ not installed'}")
+
+        out, _ = self._exec("sudo sshd -T 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|port) '")
+        if out:
+            for line in out.splitlines():
+                key, _, val = line.partition(" ")
+                lines.append(f"  {'SSH '+key+':':<12} {val}")
+
+        out, _ = self._exec("dpkg -l unattended-upgrades 2>/dev/null | grep '^ii' | awk '{print $3}'")
+        lines.append(f"  {'Auto-updates:':<12} {'enabled (v' + out + ')' if out else '─ not installed'}")
+
+        # ── UFW open ports ────────────────────────────────────────
+        out, _ = self._exec("sudo ufw status numbered 2>/dev/null | grep ALLOW | awk '{print $4}' | sort -u")
+        if out:
+            lines.append("\n── Open Firewall Ports ─────────────────────────────────")
+            for port in out.splitlines():
+                lines.append(f"  → {port.strip()}")
+
+        # ── Docker containers ─────────────────────────────────────
+        out, _ = self._exec(
+            "docker ps -a --format 'table {{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}' 2>/dev/null"
+        )
+        if out and "NAMES" in out:
+            lines.append("\n── Docker Containers ───────────────────────────────────")
+            for row in out.splitlines()[1:]:
+                parts = row.split("|")
+                if len(parts) >= 3:
+                    name, image, status = parts[0], parts[1], parts[2]
+                    icon = "✓" if status.lower().startswith("up") else "✗"
+                    lines.append(f"  {icon} {name:<25} {image:<30} {status}")
+
+        # ── PM2 apps ──────────────────────────────────────────────
+        out, _ = self._exec("pm2 jlist 2>/dev/null")
+        if out:
+            try:
+                import json as _json
+                apps = _json.loads(out)
+                if apps:
+                    lines.append("\n── PM2 Apps ────────────────────────────────────────────")
+                    for app in apps:
+                        name   = app.get("name", "?")
+                        status = app.get("pm2_env", {}).get("status", "?")
+                        pid    = app.get("pid", "─")
+                        icon   = "✓" if status == "online" else "✗"
+                        lines.append(f"  {icon} {name:<25} [{status}]  PID: {pid}")
+            except Exception:
+                pass
+
+        # ── Systemd services (user-deployed) ──────────────────────
+        out, _ = self._exec(
+            "systemctl list-units --type=service --state=active --no-legend --no-pager 2>/dev/null"
+            " | grep -v '@' | awk '{print $1}' | grep -v '^systemd' | head -20"
+        )
+        if out:
+            lines.append("\n── Active Systemd Services (user) ──────────────────────")
+            for svc in out.splitlines():
+                lines.append(f"  ✓ {svc.strip()}")
+
+        lines.append("\n" + "=" * 60)
+        return "\n".join(lines)
+
+
         """Check a single app across PM2/systemd/docker."""
         logger.info(f"[MONITOR] Checking app: {app_name}")
         sys_health = self._check_system()

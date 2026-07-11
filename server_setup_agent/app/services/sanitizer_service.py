@@ -48,14 +48,14 @@ class SanitizerService:
         - Strips leading/trailing whitespace
         - Removes the dangerous --no-preserve-root flag
         - Collapses repeated whitespace
-        - Strips any accidentally embedded credential values
+
+        NOTE: We intentionally do NOT scrub credential values from the command
+        string here. Registered secrets (host IP, username, etc.) may legitimately
+        appear in commands (e.g. docker bind address 127.0.0.1, ssh targets).
+        Scrubbing them corrupts valid commands. Credential scrubbing is applied
+        only to command OUTPUT (stdout/stderr) in BaseExecutor.execute().
         """
         cmd = command.strip()
         cmd = cmd.replace("--no-preserve-root", "")
         cmd = re.sub(r'\s+', ' ', cmd).strip()
-
-        # Belt-and-suspenders: if a credential somehow ended up in the command
-        # string (e.g. the LLM hallucinated a password), strip it out.
-        cmd = scrub_credentials(cmd)
-
         return cmd

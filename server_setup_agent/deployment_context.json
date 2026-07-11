@@ -1,10 +1,11 @@
 {
-  "github_url": "https://github.com/Meetri-IT/voice_ai_backend.git",
-  "stack": "fastapi",
-  "port": "8001",
-  "domain": "192.168.56.101",
-  "app_name": "voice-ai-backend",
-  "app_path": "/opt/voice-ai-backend",
+  "github_url": "https://github.com/Meetri-IT/pm-frontend.git",
+  "stack": "vite",
+  "port": "8006",
+  "domain": "_",
+  "app_name": "pm-frontend",
+  "app_path": "/opt/pm-frontend",
   "env_vars": {},
-  "process_manager": "docker"
+  "process_manager": "pm2",
+  "branch": "main"
 }

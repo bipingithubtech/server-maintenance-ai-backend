@@ -1,24 +1,16 @@
 {
   "tasks": [
     "base",
-    "nginx",
     "nodejs",
     "pm2",
     "docker",
-    "python",
-    "ssh_harden",
-    "fail2ban",
-    "firewall",
-    "auto_updates"
+    "firewall"
   ],
-  "infra_services": [
-    "postgres"
-  ],
+  "infra_services": [],
   "extra_packages": [],
   "extra_commands": [],
-  "firewall_ports": [
-    "5432"
-  ],
-  "server_purpose": "web server with Node.js, Python, Postgres, and security features",
-  "new_username": ""
+  "firewall_ports": [],
+  "server_purpose": "Node.js app server with PM2",
+  "new_username": "",
+  "your_public_key": ""
 }

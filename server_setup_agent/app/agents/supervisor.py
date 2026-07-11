@@ -24,6 +24,7 @@ from app.prompts.supervisor_prompt import SUPERVISOR_PROMPT
 
 AgentRoute = Literal[
     "setup",
+    "user_management",
     "deployment",
     "security",
     "monitoring",

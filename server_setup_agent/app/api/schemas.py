@@ -1,33 +1,86 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import Optional, Dict, Any
+from app.core.config import settings
+
 
 class ServerCredentials(BaseModel):
     """
     Secure schema to accept target server credentials from the frontend.
     These are passed directly to the Executor and never exposed to the LLM.
     """
-    executor_type: str = "local" # 'local' or 'ssh'
+    executor_type: str = "local"  # 'local' or 'ssh'
     host: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
     key_filename: Optional[str] = None
     port: int = 22
+    github_token: Optional[str] = None  # PAT for cloning private GitHub repos
+
+    @model_validator(mode="after")
+    def apply_ssh_defaults(self) -> "ServerCredentials":
+        if self.executor_type == "ssh":
+            if not self.host:
+                self.host = settings.SSH_HOST
+            if not self.username:
+                self.username = settings.SSH_USERNAME
+            if self.port == 22 and settings.SSH_PORT != 22:
+                self.port = settings.SSH_PORT
+            # Apply password default only if no key is provided
+            if not self.key_filename and not self.password:
+                if settings.SSH_KEY_PATH:
+                    self.key_filename = settings.SSH_KEY_PATH
+                elif settings.SSH_PASSWORD:
+                    self.password = settings.SSH_PASSWORD
+        return self
 
     def to_config(self) -> Dict[str, Any]:
-        """Converts to a kwargs dictionary suitable for ExecutorFactory."""
         return {
-            "host": self.host,
-            "username": self.username,
-            "password": self.password,
+            "host":         self.host,
+            "username":     self.username,
+            "password":     self.password,
             "key_filename": self.key_filename,
-            "port": self.port
+            "port":         self.port,
         }
 
+
+class DeploymentParams(BaseModel):
+    """
+    Optional extra params for deployment — sent by frontend instead of
+    interactive prompts. If omitted, agent falls back to prompting.
+    """
+    branch:          Optional[str] = None   # git branch to deploy
+    process_manager: Optional[str] = None   # pm2 | systemd | docker
+    env_vars:        Optional[Dict[str, str]] = None  # .env key-value pairs
+
+
+class SetupParams(BaseModel):
+    """
+    Optional extra params for fresh server setup sent by frontend.
+    If omitted, agent asks interactively.
+    """
+    new_username:     Optional[str] = None   # new sudo username
+    new_password:     Optional[str] = None   # password for new user
+    your_public_key:  Optional[str] = None   # SSH public key for new user
+
+
 class QueryRequest(BaseModel):
-    query: str
-    credentials: Optional[ServerCredentials] = ServerCredentials()
+    query:             str
+    credentials:       Optional[ServerCredentials] = None
+    deployment_params: Optional[DeploymentParams]  = None
+    setup_params:      Optional[SetupParams]        = None
+    conversation_id:   Optional[str] = None         # for multi-turn conversations
+
+    @model_validator(mode="after")
+    def default_credentials(self) -> "QueryRequest":
+        if self.credentials is None:
+            self.credentials = ServerCredentials()
+        return self
+
 
 class QueryResponse(BaseModel):
-    agent: str
-    reason: str
-    result: Optional[str] = None  # The actual agent execution output
+    agent:           str
+    reason:          str
+    result:          Optional[str] = None
+    needs_input:     bool = False           # True when agent needs more info from user
+    question:        Optional[str] = None   # The question to show in frontend chat
+    conversation_id: Optional[str] = None   # ID to continue the conversation

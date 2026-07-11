@@ -20,7 +20,7 @@ Supported setup tasks:
   - python         : install python3 + pip + venv
   - firewall       : UFW setup (deny all, allow SSH/80/443 as relevant + custom ports)
   - fail2ban       : SSH brute-force protection
-  - ssh_harden     : disable root login, disable password auth, set MaxAuthTries
+  - ssh_harden     : disable root login, key-only auth (production-safe default), set MaxAuthTries
   - bootstrap_user : create a new sudo user with SSH key access (root-only fresh server flow)
   - auto_updates   : enable unattended-upgrades for automatic security patches
   - custom         : any additional packages/commands the user specifies
@@ -54,15 +54,17 @@ from app.tools.ssh_tool import SSHTool
 
 @dataclass
 class SetupContext:
-    tasks:           List[str]
-    infra_services:  List[str]
-    extra_packages:  List[str]
-    extra_commands:  List[str]
-    firewall_ports:  List[str]
-    open_ports:      List[str]
-    suggestions:     List[str] = field(default_factory=list)
-    server_purpose:  str = ""
-    new_username:    str = ""   # used by bootstrap_user task
+    tasks:            List[str]
+    infra_services:   List[str]
+    extra_packages:   List[str]
+    extra_commands:   List[str]
+    firewall_ports:   List[str]
+    open_ports:       List[str]
+    suggestions:      List[str] = field(default_factory=list)
+    server_purpose:   str = ""
+    new_username:     str = ""        # used by bootstrap_user task
+    new_user_password:str = ""        # password for the new user (not stored to disk)
+    your_public_key:  str = ""        # optional SSH public key for the new user
 
 
 # ── LLM gather prompt ──────────────────────────────────────────────────────────
@@ -79,7 +81,7 @@ Available setup tasks:
   python           - install Python3, pip, venv
   firewall         - configure UFW (deny all, allow SSH/80/443 as relevant + custom ports)
   fail2ban         - SSH brute-force protection
-  ssh_harden       - disable root SSH login, disable password auth, set MaxAuthTries (key-only login)
+  ssh_harden       - disable root SSH login, key-only auth (production-safe default), set MaxAuthTries
   bootstrap_user   - create a new sudo user with SSH key access (run when connected as root on a fresh server)
   auto_updates     - enable unattended-upgrades for automatic security patches
 
@@ -103,18 +105,19 @@ JSON fields:
                    - "fail2ban not included — recommended to protect SSH from brute-force attacks"
                    - "docker not included but redis/postgres requested — docker is required to run infra containers"
                    - "firewall not included — recommended to block unused ports"
-                   - "ssh_harden not included — recommended to disable root login and password auth"
+                   - "ssh_harden not included — recommended to disable root login and enforce key-only SSH"
                    - "auto_updates not included — recommended so the server keeps patching itself"
                    - "if connecting as root on a fresh server, consider bootstrap_user to create a sudo user before hardening SSH"
                    Only suggest things that are genuinely missing and useful. Keep suggestions concise.
 
 Rules:
-- If user mentions redis/postgres/mysql/mongodb: put in infra_services (NOT extra_packages)
+- If user mentions redis/postgres/mysql/mongodb: put in infra_services ONLY — NEVER put them in tasks
 - infra_services always require docker task to be included
 - If user mentions "root", "fresh server", or "create a user": include bootstrap_user and ask for new_username if not given
 - If user says "full setup": include all tasks + common infra (redis, postgres)
 - NEVER guess firewall_ports unless user explicitly mentions them
 - bootstrap_user should run BEFORE ssh_harden in practice (handled by execution order, not by you)
+- NEVER include infra service names (redis, postgres, mysql, mongodb) in tasks — they only belong in infra_services
 - Return ONLY valid JSON
 
 Examples:
@@ -145,7 +148,14 @@ class SetupAgent:
         executor_type:   str = "local",
         executor_config: Dict[str, Any] = None,
         server_label:    Optional[str] = None,
+        agent_ignore_ips: str = "",
     ):
+        """
+        agent_ignore_ips: space-separated IP(s)/CIDR(s) of the machine(s) this
+        agent itself connects FROM (e.g. your dev box's host-only adapter IP).
+        Passed through to fail2ban's jail config so the agent's own reconnect
+        attempts are never mistaken for brute-force and banned.
+        """
         if executor_config is None:
             executor_config = {}
 
@@ -153,6 +163,7 @@ class SetupAgent:
         self.llm          = get_llm()
         self.alerter      = TeamsAlerter()
         self.server_label = server_label or executor_config.get("host", "unknown")
+        self.agent_ignore_ips = agent_ignore_ips
 
         # Tool instances
         self.linux    = LinuxTool(self.executor)
@@ -180,15 +191,132 @@ class SetupAgent:
         alphabet = string.ascii_letters + string.digits
         return "".join(secrets.choice(alphabet) for _ in range(length))
 
+    # ── Server scan — check what's already installed ───────────────────────────
+
+    def _scan_server(self) -> Dict[str, Any]:
+        """
+        Scan the server and return what's already installed with versions.
+        Used to skip tasks that are already done.
+        """
+        installed = {}
+
+        checks = {
+            "base":     ("curl --version 2>/dev/null | head -1", "curl"),
+            "nginx":    ("nginx -v 2>&1 | head -1",              "nginx"),
+            "docker":   ("docker --version 2>/dev/null",          "Docker"),
+            "nodejs":   ("node --version 2>/dev/null",            "node"),
+            "pm2":      ("pm2 --version 2>/dev/null",             "pm2"),
+            "python":   ("python3 --version 2>/dev/null",         "Python"),
+            "fail2ban": ("fail2ban-client --version 2>/dev/null | head -1", "Fail2Ban"),
+            "ufw":      ("sudo ufw status 2>/dev/null | head -1", "Status"),
+        }
+
+        for task, (cmd, keyword) in checks.items():
+            out, _ = self._exec(cmd)
+            if out and keyword.lower() in out.lower():
+                # Extract version string
+                version = out.strip().split("\n")[0]
+                installed[task] = version
+            else:
+                installed[task] = None
+
+        # Check ssh_harden — is root login already disabled?
+        out, _ = self._exec("sudo sshd -T 2>/dev/null | grep permitrootlogin")
+        installed["ssh_harden"] = "already hardened" if "no" in out.lower() else None
+
+        # Check auto_updates
+        out, _ = self._exec("dpkg -l unattended-upgrades 2>/dev/null | grep '^ii'")
+        installed["auto_updates"] = "installed" if out else None
+
+        # Check infra containers — are they already running?
+        infra_container_names = {
+            "redis":    "infra_redis",
+            "postgres": "infra_postgres",
+            "mysql":    "infra_mysql",
+            "mongodb":  "infra_mongodb",
+        }
+        for svc, container_name in infra_container_names.items():
+            out, _ = self._exec(
+                f"docker ps --filter name=^{container_name}$ --format '{{{{.Status}}}}' 2>/dev/null"
+            )
+            if out and "up" in out.lower():
+                installed[svc] = f"running ({out.strip()})"
+            else:
+                installed[svc] = None
+
+        return installed
+
     # ── Phase 1: gather via ONE LLM call ──────────────────────────────────────
 
-    def _gather_context(self, query: str) -> SetupContext:
-        """One LLM call to understand what the user wants, then ask for extras."""
+    def _gather_context(self, query: str, prefill: Dict[str, Any] = None) -> SetupContext:
+        """
+        One LLM call to understand what the user wants.
+        In API mode: prefill contains all answers upfront (from setup_params).
+        In CLI mode: falls back to input() for missing info.
+        Raises NeedsInputError if called from API and a required field is missing.
+        """
+        from app.services.conversation_service import NeedsInputError
 
-        messages = [
-            SystemMessage(content=_GATHER_SYSTEM),
-            HumanMessage(content=query),
-        ]
+        pf       = prefill or getattr(self, '_prefill', None) or {}
+        api_mode = getattr(self, '_api_mode', False)
+
+        # ── Early exit: plan was already confirmed by the user in a prior turn ──
+        if pf.get("confirmed") and pf.get("tasks"):
+            logger.info("[SETUP] Plan already confirmed — skipping LLM gather phase")
+            ctx = SetupContext(
+                tasks             = pf.get("tasks", []),
+                infra_services    = pf.get("infra_services", []),
+                extra_packages    = pf.get("extra_packages", []),
+                extra_commands    = pf.get("extra_commands", []),
+                firewall_ports    = pf.get("firewall_ports", []),
+                open_ports        = pf.get("firewall_ports", []),
+                suggestions       = pf.get("suggestions", []),
+                server_purpose    = pf.get("server_purpose", ""),
+                new_username      = pf.get("new_username", ""),
+                # password may be keyed as 'new_user_password' (from ctx.__dict__)
+                # or 'new_password' (from the need_password step prefill)
+                new_user_password = pf.get("new_user_password", "") or pf.get("new_password", ""),
+                your_public_key   = pf.get("your_public_key", ""),
+            )
+            self._save_context(ctx)
+            return ctx
+
+        # ── Resume mid-conversation: user added something at the confirm prompt ──
+        resume_messages  = pf.pop("_resume_messages", None)
+        extra_request    = pf.pop("_extra_request", None)
+
+        # Tell the LLM which user is connected so it doesn't suggest bootstrap_user
+        connected_as = getattr(self, '_connected_as', 'root')
+        context_note = ""
+        if connected_as and connected_as != "root":
+            context_note = (
+                f"\n\nIMPORTANT: The agent is already connected as user '{connected_as}' (not root). "
+                f"Do NOT include 'bootstrap_user' in tasks. Do NOT set new_username. "
+                f"The server already has a sudo user."
+            )
+
+        if resume_messages and extra_request:
+            # Deserialise the saved LangChain messages and inject the user's addition
+            logger.info(f"[SETUP] Resuming LLM conversation with extra request: {extra_request!r}")
+            from langchain_core.messages import AIMessage
+            messages = []
+            for m in resume_messages:
+                mtype = m.get("type") if isinstance(m, dict) else getattr(m, "type", None)
+                content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+                if mtype == "system":
+                    messages.append(SystemMessage(content=content))
+                elif mtype == "human":
+                    messages.append(HumanMessage(content=content))
+                elif mtype == "ai":
+                    messages.append(AIMessage(content=content))
+            messages.append(HumanMessage(
+                content=f"Add these to the plan: {extra_request}. Return updated JSON."
+            ))
+        else:
+            messages = [
+                SystemMessage(content=_GATHER_SYSTEM + context_note),
+                HumanMessage(content=query),
+            ]
 
         while True:
             time.sleep(1)
@@ -206,13 +334,17 @@ class SetupAgent:
 
             # LLM needs more info
             if data.get("missing"):
-                print(f"\n[?] {data.get('question', 'What would you like to set up?')}")
+                question = data.get("question", "What would you like to set up?")
+                if api_mode:
+                    raise NeedsInputError(question, {
+                        "step": "gather", "messages": messages,
+                        "query": query, "prefill": pf,
+                    })
+                print(f"\n[?] {question}")
                 answer = input("    Your answer: ").strip()
                 messages.append(response)
                 messages.append(HumanMessage(content=answer))
-                continue
-
-            # Got the plan — show it to the user
+                continue            # Got the plan
             ctx = SetupContext(
                 tasks          = data.get("tasks", []),
                 infra_services = data.get("infra_services", []),
@@ -222,21 +354,91 @@ class SetupAgent:
                 open_ports     = data.get("firewall_ports", []),
                 suggestions    = data.get("suggestions", []),
                 server_purpose = data.get("server_purpose", ""),
-                new_username   = data.get("new_username", ""),
+                new_username   = data.get("new_username", "") or pf.get("new_username", ""),
+                your_public_key= "",
             )
 
-            # If infra services need docker, ensure docker is in tasks
+            # Guard: strip infra service names from tasks — they only belong in infra_services
+            _infra_names = {"redis", "postgres", "mysql", "mongodb"}
+            ctx.tasks = [t for t in ctx.tasks if t not in _infra_names]
+
             if ctx.infra_services and "docker" not in ctx.tasks:
                 ctx.tasks.insert(0, "docker")
 
-            # bootstrap_user requested but no username given — ask
-            if "bootstrap_user" in ctx.tasks and not ctx.new_username:
-                username = input("\n[?] What username should the new sudo user have? ").strip()
-                ctx.new_username = username or "deploy"
+            # bootstrap_user — only when connected as root
+            if "bootstrap_user" in ctx.tasks:
+                connected_as = getattr(self, '_connected_as', 'root')
+                if connected_as != "root":
+                    # Not root — skip bootstrap_user entirely
+                    logger.info(f"[SETUP] Skipping bootstrap_user — connected as '{connected_as}'")
+                    ctx.tasks = [t for t in ctx.tasks if t != "bootstrap_user"]
+                else:
+                    # Connected as root — collect username, password, SSH key
+                    if not ctx.new_username:
+                        if api_mode:
+                            raise NeedsInputError(
+                                "What username should the new sudo user have? (e.g. deploy, nav, abhi)",
+                                {"step": "need_username", "ctx_partial": {
+                                    "tasks": ctx.tasks, "infra_services": ctx.infra_services,
+                                    "server_purpose": ctx.server_purpose,
+                                }, "prefill": pf}
+                            )
+                        ctx.new_username = input("\n[?] Username for new sudo user: ").strip() or "deploy"
 
-            # ── Show suggestions (things user may have missed) ─────────────
-            suggestions = data.get("suggestions", [])
-            if suggestions:
+                    if pf.get("new_password"):
+                        ctx.new_user_password = pf["new_password"]
+                    elif api_mode:
+                        raise NeedsInputError(
+                            f"Set a password for user '{ctx.new_username}' (min 8 characters):",
+                            {"step": "need_password", "ctx_partial": {
+                                "tasks": ctx.tasks, "new_username": ctx.new_username,
+                                "server_purpose": ctx.server_purpose,
+                            }, "prefill": pf}
+                        )
+                    else:
+                        import getpass
+                        while True:
+                            pwd1 = getpass.getpass(f"\n    Password for '{ctx.new_username}': ")
+                            pwd2 = getpass.getpass("    Confirm: ")
+                            if pwd1 == pwd2 and len(pwd1) >= 8:
+                                ctx.new_user_password = pwd1
+                                break
+                            print("    ✗ Passwords don't match or too short.")
+
+                    # SSH public key is now REQUIRED, not optional, when
+                    # bootstrap_user runs — because ssh_harden defaults to
+                    # key-only auth. Skipping this here would silently set
+                    # up a user who gets locked out the moment ssh_harden runs.
+                    if pf.get("your_public_key"):
+                        ctx.your_public_key = pf["your_public_key"]
+                    elif api_mode:
+                        raise NeedsInputError(
+                            f"Paste the SSH public key for '{ctx.new_username}' "
+                            f"(run: cat ~/.ssh/id_ed25519.pub on your machine). "
+                            f"This is required — ssh_harden will enforce key-only login:",
+                            {"step": "need_pubkey", "ctx_partial": {
+                                "tasks": ctx.tasks, "new_username": ctx.new_username,
+                                "server_purpose": ctx.server_purpose,
+                            }, "prefill": pf}
+                        )
+                    else:
+                        while True:
+                            pubkey = input("\n    SSH public key (required): ").strip()
+                            if pubkey.startswith(("ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256")) and len(pubkey.split()) >= 2:
+                                ctx.your_public_key = pubkey
+                                break
+                            print("    ✗ Invalid key format.")
+
+            # ── Show suggestions ───────────────────────────────────────────
+            # Suggestions are disabled in API mode — user can just type what they want
+            suggestions = []
+            if not api_mode:
+                suggestions = data.get("suggestions", [])
+                suggestions = [s for s in suggestions if not any(
+                    w in s.lower() for w in ("username", "sudo user", "bootstrap", "new user", "create user")
+                )]
+
+            if suggestions and not api_mode:
                 print("\n" + "─" * 60)
                 print("  💡 Suggestions — you might also need:")
                 print("─" * 60)
@@ -246,63 +448,50 @@ class SetupAgent:
                     "\n[?] Accept all suggestions? (yes/no/partial)\n"
                     "    yes = add all  |  no = skip  |  partial = enter numbers (e.g. 1,3): "
                 ).strip().lower()
-
                 if accept == "yes":
-                    # Re-ask LLM to merge suggestions into the plan
                     messages.append(response)
-                    messages.append(HumanMessage(
-                        content="Accept all suggestions and add them to the plan. Return updated JSON."
-                    ))
+                    messages.append(HumanMessage(content="Accept all suggestions and add them to the plan. Return updated JSON."))
                     continue
                 elif accept not in ("no", ""):
-                    # Partial — user entered numbers
                     chosen = [int(x.strip()) - 1 for x in accept.split(",") if x.strip().isdigit()]
                     chosen_text = ". ".join(suggestions[i] for i in chosen if i < len(suggestions))
                     if chosen_text:
                         messages.append(response)
-                        messages.append(HumanMessage(
-                            content=f"Add these to the plan: {chosen_text}. Return updated JSON."
-                        ))
+                        messages.append(HumanMessage(content=f"Add these to the plan: {chosen_text}. Return updated JSON."))
                         continue
 
-            # ── Show the plan ──────────────────────────────────────────────
-            print("\n" + "─" * 60)
-            print(f"  Setup Plan — {ctx.server_purpose or 'Server Setup'}")
-            print("─" * 60)
-            print(f"  Tasks:     {', '.join(ctx.tasks) or 'none'}")
+            # ── Show plan + ask for extras ─────────────────────────────────
+            plan_summary = (
+                f"Setup Plan — {ctx.server_purpose or 'Server Setup'}\n"
+                f"Tasks: {', '.join(ctx.tasks) or 'none'}\n"
+            )
             if ctx.new_username:
-                print(f"  New user:  {ctx.new_username} (sudo)")
+                plan_summary += f"New user: {ctx.new_username} (sudo)\n"
             if ctx.infra_services:
-                print(f"  Infra:     {', '.join(ctx.infra_services)} (shared Docker containers)")
+                plan_summary += f"Infra: {', '.join(ctx.infra_services)}\n"
             if ctx.extra_packages:
-                print(f"  Packages:  {', '.join(ctx.extra_packages)}")
-            if ctx.firewall_ports:
-                print(f"  Ports:     {', '.join(ctx.firewall_ports)}")
-            if ctx.extra_commands:
-                print(f"  Commands: {len(ctx.extra_commands)} custom command(s)")
+                plan_summary += f"Packages: {', '.join(ctx.extra_packages)}\n"
 
-            # ── Ask for extras ─────────────────────────────────────────────
-            print()
-            extra = input(
-                "[?] Anything else to add? (e.g. 'also install postgresql and open port 5432')\n"
-                "    Press Enter to skip: "
-            ).strip()
+            if api_mode:
+                raise NeedsInputError(
+                    f"{plan_summary}\nAnything else to add? (e.g. 'also install postgresql') or type proceed to start.",
+                    {"step": "confirm", "messages": messages,
+                     "ctx_partial": ctx.__dict__, "prefill": pf}
+                )
 
+            # CLI mode — ask extras + confirm
+            print("\n" + plan_summary)
+            extra = input("[?] Anything else to add? Press Enter to skip: ").strip()
             if extra:
-                # One more LLM call to parse the extras
                 messages.append(response)
-                messages.append(HumanMessage(
-                    content=f"Add these to the plan: {extra}. Return updated JSON."
-                ))
+                messages.append(HumanMessage(content=f"Add these to the plan: {extra}. Return updated JSON."))
                 continue
 
-            # ── Confirm ────────────────────────────────────────────────────
             confirm = input("\n[?] Proceed with this setup? (yes/no): ").strip().lower()
             if not confirm.startswith("y"):
                 print("Setup cancelled.")
                 raise SystemExit(0)
 
-            # Save context
             self._save_context(ctx)
             return ctx
 
@@ -315,6 +504,9 @@ class SetupAgent:
             "firewall_ports": ctx.firewall_ports,
             "server_purpose": ctx.server_purpose,
             "new_username":   ctx.new_username,
+            # NOTE: password is intentionally NOT saved — memory only
+            # public key is safe to store (not a secret)
+            "your_public_key": ctx.your_public_key,
         }
         with open("setup_context.json", "w") as f:
             json.dump(data, f, indent=2)
@@ -324,6 +516,12 @@ class SetupAgent:
 
     def _do_base(self):
         logger.info("[SETUP] Base packages")
+        
+        self._run(
+            "while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
+            "|| sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do "
+            "echo 'Waiting for apt lock...'; sleep 3; done"
+        )
         self._run("sudo apt-get update -y")
         self._run("sudo apt-get upgrade -y")
         self._run("sudo apt-get install -y curl git wget unzip build-essential software-properties-common")
@@ -391,34 +589,72 @@ class SetupAgent:
         self.firewall.enable()
 
     def _do_fail2ban(self):
+        """
+        Installs fail2ban AND writes a jail config that whitelists this
+        agent's own IP (self.agent_ignore_ips), so the agent's automated
+        reconnects are never mistaken for a brute-force attempt and banned.
+        """
         logger.info("[SETUP] Fail2ban")
         self.security.install_fail2ban()
+        self.security.write_fail2ban_jail(ignore_ips=self.agent_ignore_ips)
 
-    def _do_ssh_harden(self):
-        logger.info("[SETUP] SSH hardening")
-        self.security.harden_ssh(max_auth_tries=3, disable_password_auth=True)
-
-    def _do_bootstrap_user(self, username: str):
+    def _do_ssh_harden(self, ctx: SetupContext):
         """
-        Must run BEFORE ssh_harden. Creates a new sudo user, generates an SSH
-        keypair LOCALLY (private key never touches the remote server), and
-        installs only the public key on the remote authorized_keys.
+        SSH hardening — key-only auth (production-safe default).
+
+        SAFETY GUARD: before disabling password auth, verifies the target
+        user actually has an SSH key installed. If not, refuses to proceed
+        rather than risk locking the account out entirely. This is the
+        check that would have prevented an earlier real lockout incident.
+        """
+        logger.info("[SETUP] SSH hardening — key-only auth")
+
+        # Determine which user will need to reconnect after hardening:
+        # if bootstrap_user ran this session, it's the new user; otherwise
+        # it's whoever this agent is currently connected as.
+        target_user = ctx.new_username if "bootstrap_user" in ctx.tasks and ctx.new_username else self._connected_as
+
+        if not self.security.verify_key_installed(target_user):
+            raise RuntimeError(
+                f"Refusing to run ssh_harden: user '{target_user}' has no SSH key "
+                f"in authorized_keys. Disabling password auth now would lock this "
+                f"account out entirely. Install a key first (via bootstrap_user's "
+                f"public_key param, or manually), then retry."
+            )
+
+        self.security.harden_ssh(max_auth_tries=3, disable_password_auth=True, require_two_factor=False)
+
+    def _do_bootstrap_user(self, username: str, your_public_key: str = ""):
+        """
+        Must run BEFORE ssh_harden.
+        Creates a new sudo user with a password (set during gather phase).
+        User can SSH in with: ssh username@server  then enter their password.
+        Optionally also installs an SSH public key if provided.
         """
         logger.info(f"[SETUP] Bootstrapping sudo user: {username}")
 
-        key_info = self.ssh_tool.generate_local_keypair(
-            key_name=f"{username}_{self.server_label}",
+        password = getattr(self, '_bootstrap_password', '')
+        if not password:
+            raise ValueError(
+                f"No password set for user '{username}'. "
+                "Password must be collected before executing bootstrap_user."
+            )
+
+        self.security.bootstrap_sudo_user(
+            username,
+            password=password,
+            public_key=your_public_key,
         )
 
-        self.security.bootstrap_sudo_user(username, key_info["public_key"])
-
-        logger.warning(
+        logger.info(
             f"[SETUP] User '{username}' created on {self.server_label}.\n"
-            f"  Private key reference: {key_info['private_key_reference']}\n"
-            f"  This is the ONLY way to log in as '{username}' once root/password login is disabled."
+            f"  Login with:  ssh {username}@<server-ip>  (then enter password)"
         )
 
-        return key_info
+        print(f"\n  ✓ User '{username}' created with sudo access.")
+        print(f"    Login next time:  ssh {username}@<server-ip>")
+        if your_public_key:
+            print(f"    SSH key also installed (can login with key too).")
 
     def _do_auto_updates(self):
         logger.info("[SETUP] Automatic security updates")
@@ -526,14 +762,96 @@ class SetupAgent:
 
     def execute_task(self, query: str) -> str:
         logger.info("[SETUP] Phase 1 — gathering setup requirements via LLM...")
-        ctx = self._gather_context(query)
+        prefill = getattr(self, '_prefill', None) or {}
+        if prefill:
+            self._api_mode = True
 
-        logger.info(f"[SETUP] Phase 2 — executing {len(ctx.tasks)} tasks...")
+        # ── Check connected username BEFORE gather so bootstrap_user is skipped ──
+        # Get username directly from executor config — avoids sanitizer scrubbing whoami output
+        connected_as = getattr(self.executor, 'username', None) or 'unknown'
+        self._connected_as = connected_as
+        logger.info(f"[SETUP] Connected as: '{connected_as}'")
+
+        # ── If connected as root, bootstrap_user is MANDATORY ─────────────────
+        # Force it into the prefill/query so the LLM always includes it,
+        # and the gather phase always asks for username/password/pubkey.
+        if connected_as == "root":
+            if "bootstrap_user" not in query.lower() and not prefill.get("new_username"):
+                query = f"{query} (connected as root — must create a new sudo user first)"
+            logger.info("[SETUP] Root connection detected — bootstrap_user will be enforced")
+
+        ctx = self._gather_context(query, prefill=prefill)
+
+        # ── Enforce bootstrap_user when connected as root ──────────────────────
+        if connected_as == "root" and "bootstrap_user" not in ctx.tasks:
+            logger.info("[SETUP] Injecting bootstrap_user — connected as root")
+            ctx.tasks.insert(0, "bootstrap_user")
+
+        # Store password temporarily in memory only — never written to disk
+        self._bootstrap_password = ctx.new_user_password
+        # ── Scan what's already on the server ─────────────────────────────────
+        logger.info("[SETUP] Scanning server for existing installations...")
+        print("\n" + "─" * 60)
+        print("  Scanning server — checking what's already installed...")
+        print("─" * 60)
+        installed = self._scan_server()
+
+        already_done = []
+        tasks_to_run = []
+        for task in ctx.tasks:
+            if task in installed and installed[task]:
+                already_done.append((task, installed[task]))
+            else:
+                tasks_to_run.append(task)
+
+        # Check infra services against scan results
+        infra_already_running = []
+        infra_to_deploy = []
+        for svc in ctx.infra_services:
+            if installed.get(svc):
+                infra_already_running.append((svc, installed[svc]))
+            else:
+                infra_to_deploy.append(svc)
+
+        # Show scan results
+        if already_done:
+            print("\n  Already installed — will skip:")
+            for task, version in already_done:
+                print(f"    ✓ {task:<20} {version}")
+        if infra_already_running:
+            print("\n  Infra already running — will skip:")
+            for svc, status in infra_already_running:
+                print(f"    ✓ {svc:<20} {status}")
+        if tasks_to_run:
+            print("\n  Will install:")
+            for task in tasks_to_run:
+                print(f"    → {task}")
+        if infra_to_deploy:
+            print("\n  Will deploy infra:")
+            for svc in infra_to_deploy:
+                print(f"    → {svc}")
+        if not tasks_to_run and not infra_to_deploy and not ctx.extra_packages:
+            print("\n  ✓ Everything requested is already installed.")
+        elif not tasks_to_run and not infra_to_deploy:
+            pass  # extra_packages will be shown below
+
+        if not tasks_to_run and not infra_to_deploy and not ctx.extra_packages:
+            return "SETUP COMPLETE\n\nAll requested components are already installed. Nothing to do."
+
+        # In API mode — skip the confirm prompt, just proceed
+        if not getattr(self, '_api_mode', False):
+            confirm = input("[?] Proceed with installation? (yes/no): ").strip().lower()
+            if not confirm.startswith("y"):
+                return "Setup cancelled."
+
+        logger.info(f"[SETUP] Phase 2 — executing {len(tasks_to_run)} tasks...")
         results = []
 
-        # Enforce safe ordering: bootstrap_user must run before ssh_harden,
-        # and ssh_harden/firewall should run near the end (after everything
-        # else is installed) so a config mistake doesn't block remaining steps.
+        # Add already-done items to results as skipped
+        for task, version in already_done:
+            results.append(f"⏭ {task} (already installed: {version})")
+
+        
         order_priority = {
             "bootstrap_user": 0,
             "base": 1,
@@ -547,7 +865,7 @@ class SetupAgent:
             "firewall": 5,
             "ssh_harden": 6,  # last — riskiest step
         }
-        ordered_tasks = sorted(ctx.tasks, key=lambda t: order_priority.get(t, 99))
+        ordered_tasks = sorted(tasks_to_run, key=lambda t: order_priority.get(t, 99))
 
         simple_task_map = {
             "base":         self._do_base,
@@ -557,7 +875,6 @@ class SetupAgent:
             "pm2":          self._do_pm2,
             "python":       self._do_python,
             "fail2ban":     self._do_fail2ban,
-            "ssh_harden":   self._do_ssh_harden,
             "auto_updates": self._do_auto_updates,
         }
 
@@ -566,7 +883,12 @@ class SetupAgent:
                 if task == "firewall":
                     self._do_firewall(ctx)
                 elif task == "bootstrap_user":
-                    self._do_bootstrap_user(ctx.new_username or "deploy")
+                    self._do_bootstrap_user(
+                        ctx.new_username or "deploy",
+                        your_public_key=ctx.your_public_key,
+                    )
+                elif task == "ssh_harden":
+                    self._do_ssh_harden(ctx)
                 elif task in simple_task_map:
                     simple_task_map[task]()
                 else:
@@ -590,10 +912,14 @@ class SetupAgent:
                 results.append(f"✗ extra packages: {e}")
 
         # Infrastructure services (Redis, Postgres etc. as shared Docker containers)
-        if ctx.infra_services:
+        # Add already-running infra to results as skipped
+        for svc, status in infra_already_running:
+            results.append(f"⏭ {svc} (already running: {status})")
+
+        if infra_to_deploy:
             try:
-                connection_info = self._do_infra(ctx.infra_services)
-                results.append(f"✓ infra services: {', '.join(ctx.infra_services)}")
+                connection_info = self._do_infra(infra_to_deploy)
+                results.append(f"✓ infra services: {', '.join(infra_to_deploy)}")
                 print("\n  Infrastructure connection info (localhost-only):")
                 for svc, info in connection_info.items():
                     print(f"    {svc}: 127.0.0.1:{info['port']}")
@@ -612,6 +938,9 @@ class SetupAgent:
 
         summary = "\n".join(results)
         failed  = [r for r in results if r.startswith("✗")]
+
+        # Clear password from memory — it was only needed during bootstrap_user
+        self._bootstrap_password = ""
 
         if failed:
             self.alerter.warning(

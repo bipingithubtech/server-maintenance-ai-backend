@@ -46,6 +46,7 @@ class DeploymentContext:
     domain           : str
     env_vars         : Dict[str, str] = field(default_factory=dict)
     process_manager  : str = ""   # pm2 | systemd | docker
+    branch           : str = "main"  # branch to clone
 
     # Derived — filled automatically
     app_name   : str = ""
@@ -68,15 +69,23 @@ Required fields:
   stack       - one of: react, vite, angular, nextjs, nodejs, nestjs, fastapi, flask, django
                 IMPORTANT: "nextjs" = Next.js (frontend framework). "nestjs" = NestJS (backend Node framework).
                 If user says "next js" for a backend repo, clarify — they likely mean "nestjs".
-  port        - integer port the app server listens on (NOT 80 or 443)
-  domain      - domain name or IP address for nginx
+  port        - the internal port the app process listens on (NOT 80 or 443 — nginx always listens on 80).
+                For backend stacks (fastapi, flask, django, nodejs, nestjs): this is the app server port
+                  e.g. uvicorn port 8001 → nginx proxies 80 → localhost:8001
+                For frontend stacks (react, vite, angular): this is the Vite/webpack dev server port
+                  (nginx serves static files from /dist, so port is not used in the nginx config,
+                   but still collect it in case the user needs to run the dev server)
+
+Optional fields (do NOT ask for these if not provided — they can be filled automatically):
+  domain      - domain name or IP address for nginx server_name. If not provided, return "".
 
 Optional:
   env_vars    - object with KEY: "value" pairs if the app needs a .env file (empty object {} if not needed)
 
 Rules:
-- If the user message contains all required fields, return JSON immediately.
-- If any required field is missing, return JSON with a "missing" array listing what is missing and a "question" string asking for all missing fields at once.
+- If the user message contains github_url, stack, and port, return JSON immediately — domain is optional.
+- If github_url, stack, or port is missing, return JSON with a "missing" array and a "question" string.
+- NEVER list "domain" as missing — it is optional and will be filled automatically from the server connection.
 - NEVER guess port. If not provided, list it as missing.
 - Return ONLY valid JSON. No markdown, no explanation.
 
@@ -85,8 +94,11 @@ Examples:
 User: "deploy https://github.com/Org/repo.git stack=nextjs port=5006 domain=192.168.1.10 no-env"
 Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"5006","domain":"192.168.1.10","env_vars":{}}
 
+User: "deploy https://github.com/Org/repo.git stack=nextjs port=5006"
+Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"5006","domain":"","env_vars":{}}
+
 User: "deploy https://github.com/Org/repo.git stack=nextjs"
-Response: {"missing":["port","domain"],"question":"What port does the app run on, and what domain or IP should nginx use?"}
+Response: {"missing":["port"],"question":"What port does the app run on internally? (nginx will proxy port 80 to this)"}
 
 User: "deploy https://github.com/Org/repo.git stack=fastapi port=8000 domain=myapp.com env DATABASE_URL=postgres://localhost/db SECRET_KEY=abc123"
 Response: {"github_url":"https://github.com/Org/repo.git","stack":"fastapi","port":"8000","domain":"myapp.com","env_vars":{"DATABASE_URL":"postgres://localhost/db","SECRET_KEY":"abc123"}}
@@ -110,17 +122,139 @@ class DeploymentAgent:
         self.alerter  = TeamsAlerter()
         self._server  = executor_config.get("host", "unknown")
 
+    # ── Branch fetch ──────────────────────────────────────────────────────────
+
+    def _is_private_repo(self, github_url: str) -> bool:
+        """
+        Returns True if the repo is private (unauthenticated API returns 404).
+        Returns False if public or if the check fails (assume public, try anyway).
+        """
+        import urllib.request as _req, json as _json
+        try:
+            clean = github_url.replace("https://github.com/", "").replace(".git", "").strip("/")
+            parts = clean.split("/")
+            if len(parts) < 2:
+                return False
+            owner, repo = parts[0], parts[1]
+            api_url = f"https://api.github.com/repos/{owner}/{repo}"
+            req = _req.Request(api_url, headers={
+                "User-Agent": "server-setup-agent",
+                "Accept": "application/vnd.github.v3+json",
+            })
+            with _req.urlopen(req, timeout=6) as resp:
+                data = _json.loads(resp.read().decode())
+                return data.get("private", False)
+        except Exception as e:
+            # 404 = private (unauthenticated), other errors = assume public
+            return "404" in str(e) or "HTTP Error 404" in str(e)
+
+    def _try_read_server_token(self) -> str:
+        """
+        Attempt to read a GitHub token from ~/.github_token on the remote server.
+        Returns the token string or empty string.
+        """
+        try:
+            _, out, _ = self.executor.execute("cat ~/.github_token 2>/dev/null")
+            token = out.strip()
+            if token and not token.startswith("cat:") and len(token) > 10:
+                logger.info("[DEPLOY] Found GitHub token from ~/.github_token on server")
+                return token
+        except Exception:
+            pass
+        return ""
+
+    def _fetch_branches(self, github_url: str) -> list:
+        """
+        Fetch available branches from GitHub API.
+        Works for public repos without auth.
+        Returns list of branch names, or [] on failure.
+        """
+        import urllib.request, json as _json
+        try:
+            # Parse owner/repo from URL
+            clean = github_url.replace("https://github.com/", "").replace(".git", "").strip("/")
+            parts = clean.split("/")
+            if len(parts) < 2:
+                return []
+            owner, repo = parts[0], parts[1]
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=50"
+            req = urllib.request.Request(api_url, headers={
+                "User-Agent": "server-setup-agent",
+                "Accept": "application/vnd.github.v3+json",
+            })
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = _json.loads(resp.read().decode())
+                return [b["name"] for b in data]
+        except Exception:
+            return []
+
     # ── Phase 1: gather context via LLM ───────────────────────────────────────
 
     def _gather_context(self, query: str) -> DeploymentContext:
         """
         Single LLM call to extract all required deployment info.
-        If anything is missing, prints the LLM's question and prompts the user.
-        Loops until all required fields are collected.
-        Saves final context to deployment_context.json before returning.
+        In API mode: raises NeedsInputError instead of calling input().
+        In CLI mode: falls back to input() prompts.
         """
+        from app.services.conversation_service import NeedsInputError
+        pf       = getattr(self, '_prefill', None) or {}
+        api_mode = True  # always API mode — CLI uses server_cli.py directly
+
+        # ── Early exit: all core fields already in prefill from a prior conversation turn ──
+        # This happens after need_process_manager / need_branch / need_github_token steps.
+        # Skip the LLM entirely and go straight to the post-LLM checks.
+        if pf.get("github_url") and pf.get("stack") and pf.get("port"):
+            logger.info("[DEPLOY] Core fields already in prefill — skipping LLM gather")
+            server_host = (
+                self._server
+                if self._server and self._server not in ("unknown", "None", None, "127.0.0.1", "localhost")
+                else ""
+            )
+            if not server_host:
+                executor_host = getattr(self.executor, 'host', None) or getattr(self.executor, 'hostname', None)
+                if executor_host and executor_host not in ("127.0.0.1", "localhost", None):
+                    server_host = executor_host
+            ctx = DeploymentContext(
+                github_url = pf["github_url"],
+                stack      = pf["stack"].lower(),
+                port       = str(pf["port"]),
+                domain     = pf.get("domain") or server_host or "_",
+                env_vars   = pf.get("env_vars", {}),
+            )
+            # Apply already-collected answers
+            if pf.get("process_manager"):
+                ctx.process_manager = pf["process_manager"]
+            if pf.get("branch"):
+                ctx.branch = pf["branch"]
+            # Fall through to the post-LLM checks below (process_manager, branch, token, env)
+            return self._complete_context(ctx, pf, query)
+
+        # Auto-fill domain from the connected server's host if not already in prefill
+        # Check both _server attr and executor config — host may be None for local executors
+        server_host = (
+            self._server
+            if self._server and self._server not in ("unknown", "None", None, "127.0.0.1", "localhost")
+            else ""
+        )
+        # For local executor the host is the actual server IP from the SSH connection config
+        if not server_host:
+            executor_host = getattr(self.executor, 'host', None) or getattr(self.executor, 'hostname', None)
+            if executor_host and executor_host not in ("127.0.0.1", "localhost", None):
+                server_host = executor_host
+        if server_host and not pf.get("domain"):
+            pf["domain"] = server_host
+
+        # Inject server host into system prompt so LLM knows domain is pre-filled
+        gather_system = _GATHER_SYSTEM
+        if server_host:
+            gather_system = _GATHER_SYSTEM + (
+                f"\n\nNOTE: The user is already connected to server '{server_host}'. "
+                f"Use '{server_host}' as the domain value automatically — "
+                f"do NOT list domain as missing."
+            )
+
         messages = [
-            SystemMessage(content=_GATHER_SYSTEM),
+            SystemMessage(content=gather_system),
             HumanMessage(content=query),
         ]
 
@@ -128,132 +262,143 @@ class DeploymentAgent:
             time.sleep(1)
             response = self.llm.invoke(messages)
             raw = response.content.strip()
-
-            # Strip markdown code fences if present
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
 
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                # LLM returned non-JSON — ask again
                 messages.append(response)
                 messages.append(HumanMessage(content="Please respond with valid JSON only."))
                 continue
 
-            # Missing fields — ask the user
+            # Missing required fields — ask frontend
             if "missing" in data:
-                print(f"\n[?] {data.get('question', 'Please provide the missing information.')}")
-                user_answer = input("    Your answer: ").strip()
-                messages.append(response)
-                messages.append(HumanMessage(content=user_answer))
-                continue
+                question = data.get("question", "Please provide the missing deployment information.")
+                raise NeedsInputError(question, {
+                    "step": "gather", "messages": messages,
+                    "query": query, "prefill": pf, "agent": "deployment",
+                })
 
-            # All fields present — build context
+            # All fields present — build context and complete
             ctx = DeploymentContext(
                 github_url = data["github_url"],
                 stack      = data["stack"].lower(),
                 port       = str(data["port"]),
-                domain     = data["domain"],
+                domain     = data.get("domain") or pf.get("domain") or server_host or "_",
                 env_vars   = data.get("env_vars", {}),
             )
+            return self._complete_context(ctx, pf, query)
 
-            # ── Ask for process manager ────────────────────────────────────
-            stack = ctx.stack
-            if stack in ("react", "vite", "angular"):
-                # Static apps — no process manager needed
-                ctx.process_manager = "none"
+    def _complete_context(self, ctx: "DeploymentContext", pf: dict, query: str) -> "DeploymentContext":
+        """
+        Handles all post-LLM steps: process_manager, branch, github_token, env.
+        Called from both the LLM path and the early-exit (prefill) path.
+        Each NeedsInputError stores the full ctx_partial so the resume path
+        can skip the LLM entirely on the next turn.
+        """
+        from app.services.conversation_service import NeedsInputError
+
+        # ── Process manager ────────────────────────────────────────────
+        stack = ctx.stack
+        if pf.get("process_manager"):
+            ctx.process_manager = pf["process_manager"]
+        else:
+            if stack in ("fastapi", "flask", "django"):
+                default = "systemd"
+            elif stack in ("react", "vite", "angular"):
+                default = "pm2"  # serve built dist via PM2 + npx serve
             else:
-                print("\n" + "─" * 60)
-                print("  Process Manager")
-                print("─" * 60)
-                if stack in ("fastapi", "flask", "django"):
-                    options = "pm2 | systemd | docker"
-                    default = "systemd"
-                else:
-                    options = "pm2 | systemd | docker"
-                    default = "pm2"
-                pm_answer = input(
-                    f"\n[?] How should the app be managed? ({options})\n"
-                    f"    Press Enter for default [{default}]: "
-                ).strip().lower()
-                ctx.process_manager = pm_answer if pm_answer in ("pm2", "systemd", "docker") else default
-                print(f"  Using: {ctx.process_manager}")
-                print("─" * 60)
+                default = "pm2"
+            raise NeedsInputError(
+                f"How should the app be managed? Options: pm2 | systemd | docker  (recommended: {default})",
+                {"step": "need_process_manager", "ctx_partial": {
+                    "github_url": ctx.github_url, "stack": ctx.stack,
+                    "port": ctx.port, "domain": ctx.domain,
+                }, "prefill": pf, "agent": "deployment", "default_pm": default}
+            )
 
-            # ── Mandatory .env collection ──────────────────────────────────
-            # Always ask — never skip unless user explicitly says no.
-            # If .env.example exists on the repo, clone it first to read var names.
-            # We do a lightweight check via the GitHub raw URL.
-            print("\n" + "─" * 60)
-            print("  .env Configuration")
-            print("─" * 60)
+        # ── Branch selection ───────────────────────────────────────────
+        if pf.get("branch"):
+            ctx.branch = pf["branch"]
+        else:
+            branches = self._fetch_branches(ctx.github_url)
+            branch_list = ", ".join(f"{i+1}. {b}" for i, b in enumerate(branches)) if branches else ""
+            question = (
+                f"Which branch to deploy?\nAvailable branches: {branch_list}\n"
+                f"Enter branch name or number (default: {branches[0] if branches else 'main'}):"
+            ) if branches else "Enter branch name to deploy (default: main):"
+            raise NeedsInputError(
+                question,
+                {"step": "need_branch", "ctx_partial": {
+                    "github_url": ctx.github_url, "stack": ctx.stack,
+                    "port": ctx.port, "domain": ctx.domain,
+                    "process_manager": ctx.process_manager,
+                }, "branches": branches, "prefill": pf, "agent": "deployment"}
+            )
 
-            # Try to fetch .env.example from GitHub to show required vars
+        # ── GitHub token (private repos) ───────────────────────────────
+        from app.core.config import settings as _settings
+        github_token = (
+            pf.get("github_token")
+            or getattr(self, '_github_token', None)
+            or _settings.GITHUB_TOKEN
+        )
+        if not github_token:
+            result = self._try_read_server_token()
+            github_token = result
+
+        if not github_token:
+            is_private = self._is_private_repo(ctx.github_url)
+            if is_private:
+                raise NeedsInputError(
+                    f"The repo '{ctx.github_url}' appears to be private. "
+                    f"Please provide a GitHub Personal Access Token (PAT) with repo read access.\n"
+                    f"Create one at: https://github.com/settings/tokens/new?scopes=repo",
+                    {"step": "need_github_token", "ctx_partial": {
+                        "github_url": ctx.github_url, "stack": ctx.stack,
+                        "port": ctx.port, "domain": ctx.domain,
+                        "process_manager": ctx.process_manager,
+                        "branch": ctx.branch,
+                    }, "prefill": pf, "agent": "deployment"}
+                )
+        else:
+            self._github_token = github_token
+
+        # ── .env vars ──────────────────────────────────────────────────
+        if pf.get("env_vars") is not None:
+            ctx.env_vars = pf["env_vars"]
+        else:
             env_example_vars = []
             try:
-                import urllib.request
+                import urllib.request as _req
                 parts = ctx.github_url.replace("https://github.com/", "").replace(".git", "").split("/")
                 raw_url = f"https://raw.githubusercontent.com/{parts[0]}/{parts[1]}/HEAD/.env.example"
-                req = urllib.request.Request(raw_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    example_content = resp.read().decode()
-                for line in example_content.splitlines():
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key = line.split("=")[0].strip()
-                        env_example_vars.append(key)
-                if env_example_vars:
-                    print(f"  Found .env.example with {len(env_example_vars)} variable(s):")
-                    print(f"  {', '.join(env_example_vars)}")
+                req = _req.Request(raw_url, headers={"User-Agent": "Mozilla/5.0"})
+                with _req.urlopen(req, timeout=5) as resp:
+                    for line in resp.read().decode().splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            env_example_vars.append(line.split("=")[0].strip())
             except Exception:
-                pass  # no .env.example or no network — proceed without it
+                pass
 
-            needs_env = input("\n[?] Does this app need a .env file? (yes/no): ").strip().lower()
-
-            if needs_env.startswith("y") or needs_env.startswith("1"):
-                if env_example_vars:
-                    print(f"\n  Variables from .env.example ({len(env_example_vars)} required):")
-                    extra_raw = input(
-                        "  Add extra variable names? (comma-separated, or press Enter to skip): "
-                    ).strip()
-                    if extra_raw:
-                        env_example_vars += [v.strip() for v in extra_raw.split(",") if v.strip()]
-                else:
-                    raw_keys = input(
-                        "  Enter ALL variable names (comma-separated):\n  > "
-                    ).strip()
-                    env_example_vars = [k.strip() for k in raw_keys.split(",") if k.strip()]
-
-                if not env_example_vars:
-                    print("  No variables entered — skipping .env.")
-                else:
-                    print(f"\n  Enter value for each variable (required — press Enter to leave empty):")
-                    filled = {}
-                    for key in env_example_vars:
-                        # Show existing value from LLM parse if present
-                        existing = data.get("env_vars", {}).get(key, "")
-                        prompt = f"    {key}={f'[{existing}] ' if existing else ''}"
-                        val = input(prompt).strip()
-                        # Use existing if user just pressed Enter
-                        filled[key] = val if val else existing
-                    ctx.env_vars = filled
-                    print(f"\n  ✓ Collected {len(ctx.env_vars)} env var(s).")
-            else:
-                ctx.env_vars = {}
-                print("  Skipping .env file.")
-
-            print("─" * 60)
-
-            # Save context to disk so steps can reference it
-            self._save_context(ctx)
-
-            logger.info(
-                f"[CONTEXT] app={ctx.app_name} stack={ctx.stack} "
-                f"port={ctx.port} domain={ctx.domain} "
-                f"env_vars={list(ctx.env_vars.keys())}"
+            env_hint = f"Required variables from .env.example: {', '.join(env_example_vars)}" if env_example_vars else ""
+            raise NeedsInputError(
+                f"Does this app need a .env file? If yes, provide the variables as JSON like: "
+                f'{{\"DATABASE_URL\": \"postgres://...\", \"SECRET_KEY\": \"abc\"}}. '
+                f'If no .env needed, reply: no\n{env_hint}',
+                {"step": "need_env", "ctx_partial": {
+                    "github_url": ctx.github_url, "stack": ctx.stack,
+                    "port": ctx.port, "domain": ctx.domain,
+                    "process_manager": ctx.process_manager,
+                    "branch": ctx.branch,
+                }, "env_example_vars": env_example_vars, "prefill": pf, "agent": "deployment"}
             )
-            return ctx
+
+        self._save_context(ctx)
+        logger.info(f"[CONTEXT] app={ctx.app_name} stack={ctx.stack} port={ctx.port} branch={ctx.branch}")
+        return ctx
 
     def _save_context(self, ctx: DeploymentContext) -> None:
         """Saves deployment context to deployment_context.json."""
@@ -266,6 +411,7 @@ class DeploymentAgent:
             "app_path":        ctx.app_path,
             "env_vars":        ctx.env_vars,
             "process_manager": ctx.process_manager,
+            "branch":          ctx.branch,
         }
         with open("deployment_context.json", "w") as f:
             json.dump(data, f, indent=2)
@@ -300,9 +446,34 @@ class DeploymentAgent:
             f"sudo mkdir -p {ctx.app_path} && "
             f"sudo chown -R $(whoami):$(id -gn) {ctx.app_path}"
         )
+
+        # Build authenticated clone URL.
+        # Priority: 1) token passed from frontend/config
+        #           2) ~/.github_token file on the remote server
+        #           3) plain HTTPS (public repos only)
+        from app.core.config import settings
+        token = getattr(self, '_github_token', None) or settings.GITHUB_TOKEN
+
+        if not token:
+            # Try reading ~/.github_token from the remote server
+            result = self._inspect("cat ~/.github_token 2>/dev/null")
+            if result.strip() and "COMMAND DID NOT SUCCEED" not in result:
+                token = result.strip()
+
+        repo_path = ctx.github_url.replace("https://", "")
+        if token:
+            clone_url = f"https://{token}@{repo_path}"
+        else:
+            logger.warning(
+                "No GitHub token found. Attempting unauthenticated clone — "
+                "this will fail for private repos. "
+                "Add token to ~/.github_token on the server or set GITHUB_TOKEN in .env"
+            )
+            clone_url = ctx.github_url
+
         self._run(
-            f"git clone https://$(cat ~/.github_token)@"
-            f"{ctx.github_url.replace('https://', '')} {ctx.app_path}"
+            f"GIT_TERMINAL_PROMPT=0 git clone --branch {ctx.branch} --single-branch "
+            f"{clone_url} {ctx.app_path}"
         )
         self._run(f"sudo chown -R $(whoami):$(id -gn) {ctx.app_path}")
         files = self._inspect(f"ls {ctx.app_path}")
@@ -435,12 +606,27 @@ class DeploymentAgent:
     def _deploy_docker(self, ctx: DeploymentContext) -> None:
         """Build and run app using Docker."""
         logger.info(f"  [DOCKER] Building {ctx.app_name}")
-        # Check Dockerfile exists
+
+        # Handle case-insensitive Dockerfile names (repo has 'DockerFile' not 'Dockerfile')
+        # Normalize to lowercase so docker build works consistently
+        self.executor.execute(
+            f"test -f {ctx.app_path}/DockerFile "
+            f"&& mv {ctx.app_path}/DockerFile {ctx.app_path}/Dockerfile 2>/dev/null "
+            f"|| true"
+        )
+
+        # Auto-generate Dockerfile if still missing but repo has requirements.txt/package.json
         if not self._file_exists(f"{ctx.app_path}/Dockerfile"):
-            raise RuntimeError(
-                f"No Dockerfile found at {ctx.app_path}. "
-                "Cannot deploy with Docker."
-            )
+            has_requirements = self._file_exists(f"{ctx.app_path}/requirements.txt")
+            has_package_json = self._file_exists(f"{ctx.app_path}/package.json")
+            if has_requirements or has_package_json:
+                logger.info(f"  [DOCKER] No Dockerfile found — auto-generating for {ctx.stack}")
+                self._generate_dockerfile(ctx)
+            else:
+                raise RuntimeError(
+                    f"No Dockerfile found at {ctx.app_path} and no requirements.txt/package.json "
+                    f"to auto-generate one. Please add a Dockerfile to the repo."
+                )
         # Install Docker if needed
         code, _, _ = self.executor.execute("which docker")
         if code != 0:
@@ -449,16 +635,16 @@ class DeploymentAgent:
             self._run(f"sudo usermod -aG docker $(whoami)")
 
         # Stop existing container
-        self.executor.execute(f"docker stop {ctx.app_name} 2>/dev/null || true")
-        self.executor.execute(f"docker rm {ctx.app_name} 2>/dev/null || true")
+        self.executor.execute(f"sudo docker stop {ctx.app_name} 2>/dev/null || true")
+        self.executor.execute(f"sudo docker rm {ctx.app_name} 2>/dev/null || true")
 
         # Build image
-        self._run(f"docker build -t {ctx.app_name} {ctx.app_path}")
+        self._run(f"sudo docker build -t {ctx.app_name} {ctx.app_path}")
 
         # Run container
         env_flags = " ".join(f"-e {k}={v}" for k, v in ctx.env_vars.items())
         self._run(
-            f"docker run -d --name {ctx.app_name} "
+            f"sudo docker run -d --name {ctx.app_name} "
             f"--restart unless-stopped "
             f"-p {ctx.port}:{ctx.port} "
             f"{env_flags} "

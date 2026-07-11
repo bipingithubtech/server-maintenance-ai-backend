@@ -6,10 +6,13 @@ deny_list:
   - "mkfs"
   - "reboot"
   - "shutdown"
-  - "passwd"
   - "chmod 777"
   - "chmod -R 777"
   - "chown -R root:root /"
+  # Block interactive passwd (but NOT chpasswd which reads from stdin)
+  - " passwd "          # standalone passwd command with spaces
+  - " passwd\n"         # passwd at end of line
+  - "|passwd"           # piped to passwd
 
 allow_list:
   - "apt-get"
@@ -28,6 +31,8 @@ allow_list:
   - "useradd"
   - "userdel"
   - "usermod"
+  - "adduser"
+  - "chpasswd"
   - "top"
   - "free"
   - "df"
