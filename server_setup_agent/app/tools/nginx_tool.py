@@ -1,3 +1,4 @@
+import re
 import base64
 from pathlib import Path
 from typing import Optional, Union
@@ -19,6 +20,10 @@ class NginxTool:
     STATIC_FRAMEWORKS = {"react", "vite", "angular", "static"}
     PROXY_FRAMEWORKS  = {"fastapi", "nextjs", "nodejs", "nestjs", "flask", "django", "ai"}
 
+    # SSL cert paths used across all HTTPS configs
+    SSL_CERT = "/etc/nginx/ssl/sslcert.crt"
+    SSL_KEY  = "/etc/nginx/ssl/sslcert.key"
+
     def __init__(self, executor: BaseExecutor):
         self.executor = executor
 
@@ -36,6 +41,57 @@ class NginxTool:
             auto_reload=True,  # Always reload templates from disk, never use cache
         )
 
+    @staticmethod
+    def _is_ip(domain: str) -> bool:
+        """
+        Returns True if domain is a bare IPv4 address OR the catch-all sentinel '_'.
+        Both cases mean "no real domain" → use HTTP-only config, no SSL.
+        """
+        if not domain or domain.strip() in ("_", "", "none", "null"):
+            return True
+        return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", domain.strip()))
+
+    def ensure_ssl_cert(self, domain: str) -> str:
+        """
+        Ensures a TLS certificate exists at /etc/nginx/ssl/.
+        - If sslcert.crt already exists → reuse it, no-op.
+        - Otherwise → generate a self-signed cert for the domain.
+          Self-signed is fine for internal/staging use; swap for a real cert
+          (e.g. Let's Encrypt / your CA) any time by replacing the files.
+        Returns a status string describing what happened.
+        """
+        # Create the ssl dir if it doesn't exist
+        self.executor.execute("sudo mkdir -p /etc/nginx/ssl")
+
+        # Check if cert already exists
+        code, _, _ = self.executor.execute(f"test -f {self.SSL_CERT}")
+        if code == 0:
+            logger.info(f"SSL cert already exists at {self.SSL_CERT} — reusing.")
+            return f"SSL cert already present at {self.SSL_CERT}."
+
+        # Generate self-signed cert (valid 2 years, 2048-bit RSA)
+        logger.info(f"No SSL cert found — generating self-signed cert for {domain}")
+        cmd = (
+            f"sudo openssl req -x509 -nodes -newkey rsa:2048 "
+            f"-keyout {self.SSL_KEY} "
+            f"-out {self.SSL_CERT} "
+            f"-days 730 "
+            f"-subj \"/CN={domain}/O=Server/C=US\""
+        )
+        code, out, err = self.executor.execute(cmd)
+        if code != 0:
+            raise RuntimeError(f"Failed to generate SSL certificate:\n{err}")
+
+        # Lock down key permissions
+        self.executor.execute(f"sudo chmod 600 {self.SSL_KEY}")
+        self.executor.execute(f"sudo chmod 644 {self.SSL_CERT}")
+
+        logger.info(f"Self-signed SSL cert generated at {self.SSL_CERT}")
+        return (
+            f"Self-signed SSL certificate generated at {self.SSL_CERT}.\n"
+            f"Replace with a CA-signed cert any time by overwriting those two files."
+        )
+
     def generate_config(
         self,
         framework: str,
@@ -46,10 +102,15 @@ class NginxTool:
     ) -> str:
         """
         Generates an Nginx config string from a Jinja2 template.
+
+        - IP address  → HTTP-only template  (reverse_proxy_http / static_site_http)
+        - Domain name → HTTPS template with SSL cert paths  (reverse_proxy / static_site)
+
         app_path must be a Linux path string (e.g. '/opt/myapp/dist').
         port accepts int or string — will be coerced to int automatically.
         """
         framework_lower = framework.lower()
+        is_ip = self._is_ip(domain)
 
         # Coerce port to int if the LLM passes it as a string
         if port is not None:
@@ -61,26 +122,34 @@ class NginxTool:
         if framework_lower in self.STATIC_FRAMEWORKS:
             if not app_path:
                 raise ValueError(f"app_path is required for static framework '{framework}'")
-            template = self.jinja_env.get_template("static_site.conf.j2")
-            # app_path is already an absolute Linux path — use it as-is
+            # Auto-append /dist for React/Vite/Angular builds if not already present
+            if not app_path.rstrip("/").endswith("/dist"):
+                app_path = app_path.rstrip("/") + "/dist"
+
+            tpl_name = "static_site_http.conf.j2" if is_ip else "static_site.conf.j2"
+            template = self.jinja_env.get_template(tpl_name)
             config_str = template.render(
                 domain=domain,
                 app_name=app_name,
                 app_path=app_path,
             )
-            logger.info(f"Generated static_site config for {app_name} ({domain})")
+            mode = "http-only (IP)" if is_ip else "https (domain)"
+            logger.info(f"Generated {tpl_name} for {app_name} ({domain}) mode={mode} root={app_path}")
             return config_str
 
         elif framework_lower in self.PROXY_FRAMEWORKS:
             if not port:
                 raise ValueError(f"port is required for proxy framework '{framework}'")
-            template = self.jinja_env.get_template("reverse_proxy.conf.j2")
+
+            tpl_name = "reverse_proxy_http.conf.j2" if is_ip else "reverse_proxy.conf.j2"
+            template = self.jinja_env.get_template(tpl_name)
             config_str = template.render(
                 domain=domain,
                 app_name=app_name,
                 port=port,
             )
-            logger.info(f"Generated reverse_proxy config for {app_name} ({domain} -> {port})")
+            mode = "http-only (IP)" if is_ip else "https (domain)"
+            logger.info(f"Generated {tpl_name} for {app_name} ({domain} -> {port}) mode={mode}")
             return config_str
 
         else:
@@ -98,10 +167,14 @@ class NginxTool:
         port: Optional[Union[int, str]] = None
     ) -> str:
         """
-        Generates an Nginx config and saves it to disk in one step.
-        This avoids passing large config strings as tool arguments.
-        Returns the path where the config was saved.
+        Ensures SSL cert (when domain-based), generates config, and saves to disk.
+        Returns a status string.
         """
+        # For domain deployments, make sure the cert exists before writing the config
+        if not self._is_ip(domain):
+            cert_status = self.ensure_ssl_cert(domain)
+            logger.info(f"[SSL] {cert_status}")
+
         config_content = self.generate_config(
             framework=framework,
             domain=domain,

@@ -158,7 +158,6 @@ class SetupAgent:
         """
         if executor_config is None:
             executor_config = {}
-
         self.executor     = ExecutorFactory.get_executor(executor_type, **executor_config)
         self.llm          = get_llm()
         self.alerter      = TeamsAlerter()

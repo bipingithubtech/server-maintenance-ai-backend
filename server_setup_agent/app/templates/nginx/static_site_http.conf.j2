@@ -1,54 +1,23 @@
-# Redirect HTTP → HTTPS
+# HTTP-only — IP address deployment (no domain, no TLS possible)
 server {
     listen 80;
     listen [::]:80;
-    server_name {{ domain }} www.{{ domain }};
-
-    # Allow ACME / certbot challenges — everything else redirects
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-# HTTPS Server
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name {{ domain }} www.{{ domain }};
+    server_name {{ domain }};
 
     client_max_body_size 25M;
 
     root  {{ app_path }};
     index index.html;
 
-    # ── SSL ────────────────────────────────────────────────────────────────
-    ssl_certificate     /etc/nginx/ssl/sslcert.crt;
-    ssl_certificate_key /etc/nginx/ssl/sslcert.key;
-
-    ssl_protocols             TLSv1.2 TLSv1.3;
-    ssl_ciphers               HIGH:!aNULL:!MD5:!RC4;
-    ssl_prefer_server_ciphers on;
-
-    ssl_session_cache   shared:SSL:10m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-
-    # HSTS
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    # ── Logging ────────────────────────────────────────────────────────────
+    access_log /var/log/nginx/{{ app_name }}.access.log;
+    error_log  /var/log/nginx/{{ app_name }}.error.log warn;
 
     # ── Security headers ───────────────────────────────────────────────────
     add_header X-Frame-Options        SAMEORIGIN               always;
     add_header X-Content-Type-Options nosniff                  always;
     add_header X-XSS-Protection       "1; mode=block"          always;
     add_header Referrer-Policy        "strict-origin-when-cross-origin" always;
-
-    # ── Logging ────────────────────────────────────────────────────────────
-    access_log /var/log/nginx/{{ app_name }}.access.log;
-    error_log  /var/log/nginx/{{ app_name }}.error.log warn;
 
     # ── Gzip ───────────────────────────────────────────────────────────────
     gzip            on;

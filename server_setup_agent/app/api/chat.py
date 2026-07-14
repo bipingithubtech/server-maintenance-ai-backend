@@ -277,6 +277,22 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "need_app_type":
+        answer = user_answer.strip().lower()
+        suggested = agent_state.get("suggested", "backend")
+        if answer in ("frontend", "front", "f", "ui"):
+            prefill["app_type"] = "frontend"
+        elif answer in ("backend", "back", "b", "api"):
+            prefill["app_type"] = "backend"
+        elif answer in ("yes", "y", ""):
+            # User confirmed the suggestion
+            prefill["app_type"] = suggested
+        else:
+            prefill["app_type"] = suggested  # fallback to suggestion
+        # Merge ctx_partial so all core fields survive the resume
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
     elif step == "need_process_manager":
         default_pm = agent_state.get("default_pm", "pm2")
         pm = user_answer.strip().lower()
@@ -297,17 +313,71 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "need_port_conflict":
+        answer = user_answer.strip().lower()
+        if answer.isdigit():
+            prefill["port_conflict_answer"] = answer
+        else:
+            prefill["port_conflict_answer"] = "continue"
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
     elif step == "need_env":
         answer = user_answer.strip().lower()
-        if answer == "no" or answer == "":
+        if answer in ("no", ""):
             prefill["env_vars"] = {}
         else:
+            import json as _json
+
+            def _parse_dotenv(text: str) -> dict:
+                """
+                Parse KEY=VALUE lines (raw .env format).
+                - Strips blank lines and # comments
+                - Handles optional surrounding quotes on values
+                """
+                result = {}
+                for line in text.splitlines():
+                    line = line.strip()
+                    # Skip blanks and comment-only lines
+                    if not line or line.startswith("#"):
+                        continue
+                    # Strip inline comments (e.g. KEY=value # comment)
+                    if " #" in line:
+                        line = line[:line.index(" #")].strip()
+                    if "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key:
+                        result[key] = val
+                return result
+
+            # Try JSON first, then fall back to .env line format
             try:
-                import json as _json
                 prefill["env_vars"] = _json.loads(user_answer)
             except Exception:
-                prefill["env_vars"] = {}
+                parsed = _parse_dotenv(user_answer)
+                if parsed:
+                    prefill["env_vars"] = parsed
+                else:
+                    logger.warning(f"[need_env] Could not parse env input, storing raw: {user_answer[:120]}")
+                    prefill["env_vars"] = {}
+
         # Merge ctx_partial so early-exit path has all core fields
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
+    elif step == "need_nginx":
+        answer = user_answer.strip().lower()
+        if answer in ("no", "n", "skip"):
+            prefill["nginx_choice"] = "no"
+        elif answer in ("yes", "y"):
+            prefill["nginx_choice"] = "yes"
+        else:
+            # Treat anything else as a custom domain/IP the user wants to use
+            prefill["nginx_choice"] = user_answer.strip()
+        # Merge ctx_partial so all core fields are available on resume
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
@@ -337,6 +407,8 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
             agent._prefill = prefill
             if prefill.get("github_token"):
                 agent._github_token = prefill["github_token"]
+            if prefill.get("nginx_choice") is not None:
+                agent._nginx_choice = prefill["nginx_choice"]
             result = agent.execute_task(new_query)
 
         else:

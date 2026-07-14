@@ -29,17 +29,6 @@ class LinuxTool:
                     return f"Build skipped — dist/ already exists at {app_path}/dist with files: {check_out.strip()[:100]}"
         exit_code, stdout, stderr = self.executor.execute(command)
 
-        # Auto-recover: directory already exists — switch clone to plain git pull
-        if exit_code != 0 and "already exists and is not an empty directory" in stderr:
-            # Always take the last whitespace-separated token as the target path
-            # e.g. git clone https://$(cat ~/.github_token)@github.com/Org/repo.git /opt/myapp
-            #                                                                         ^^^^^^^^^^^
-            tokens = command.strip().split()
-            target_path = tokens[-1] if tokens else None
-            if target_path and target_path.startswith("/"):
-                pull_cmd = f"git -C {target_path} pull"
-                exit_code, stdout, stderr = self.executor.execute(pull_cmd)
-
         # Auto-recover: pdfjs-dist canvas.node webpack error — patch next.config.mjs
         if exit_code != 0 and "canvas.node" in stderr and "Module parse failed" in stderr:
             prefix_match = re.search(r'--prefix\s+(\S+)', command)

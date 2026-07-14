@@ -20,6 +20,7 @@ import re
 import json
 import base64
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
 
@@ -35,6 +36,10 @@ from app.tools.systemd_tool import SystemdTool
 from app.tools.pm2_tool import PM2Tool
 from app.services.teams_alert_service import TeamsAlerter
 
+# Absolute path to deployment_context.json — always lands in server_setup_agent/
+# regardless of what cwd the server was launched from.
+_DEPLOYMENT_CONTEXT_FILE = Path(__file__).resolve().parent.parent.parent / "deployment_context.json"
+
 
 # ── Deployment context ─────────────────────────────────────────────────────────
 
@@ -45,18 +50,30 @@ class DeploymentContext:
     port             : str
     domain           : str
     env_vars         : Dict[str, str] = field(default_factory=dict)
-    process_manager  : str = ""   # pm2 | systemd | docker
+    process_manager  : str = ""      # pm2 | systemd | docker
     branch           : str = "main"  # branch to clone
+    app_type         : str = ""      # frontend | backend
 
     # Derived — filled automatically
     app_name   : str = ""
     app_path   : str = ""
+
+    # Stacks that are always frontend (served as static files)
+    FRONTEND_STACKS = frozenset({"react", "vite", "angular"})
+    # Stacks that are always backend (run as a process)
+    BACKEND_STACKS  = frozenset({"fastapi", "flask", "django", "nodejs", "nestjs", "nextjs", "ai"})
 
     def __post_init__(self):
         if not self.github_url.endswith(".git"):
             self.github_url += ".git"
         repo = self.github_url.rstrip("/").split("/")[-1].replace(".git", "")
         self.app_name = repo.lower().replace("_", "-")
+        # app_path is set later once app_type is known — see _resolve_app_path()
+        if not self.app_path:
+            self._resolve_app_path()
+
+    def _resolve_app_path(self) -> None:
+        """Deploy everything to /opt/<app_name> regardless of frontend/backend."""
         self.app_path = f"/opt/{self.app_name}"
 
 
@@ -222,13 +239,15 @@ class DeploymentAgent:
                 env_vars   = pf.get("env_vars", {}),
             )
             # Apply already-collected answers
+            if pf.get("app_type"):
+                ctx.app_type = pf["app_type"]
+                ctx._resolve_app_path()
             if pf.get("process_manager"):
                 ctx.process_manager = pf["process_manager"]
             if pf.get("branch"):
                 ctx.branch = pf["branch"]
             # Fall through to the post-LLM checks below (process_manager, branch, token, env)
             return self._complete_context(ctx, pf, query)
-
         # Auto-fill domain from the connected server's host if not already in prefill
         # Check both _server attr and executor config — host may be None for local executors
         server_host = (
@@ -303,19 +322,18 @@ class DeploymentAgent:
         stack = ctx.stack
         if pf.get("process_manager"):
             ctx.process_manager = pf["process_manager"]
+        elif stack in ("react", "vite", "angular", "static"):
+            ctx.process_manager = ""  # static sites don't need a process manager
         else:
-            if stack in ("fastapi", "flask", "django"):
-                default = "systemd"
-            elif stack in ("react", "vite", "angular"):
-                default = "pm2"  # serve built dist via PM2 + npx serve
-            else:
-                default = "pm2"
             raise NeedsInputError(
-                f"How should the app be managed? Options: pm2 | systemd | docker  (recommended: {default})",
+                "Which process manager should be used to run the app?\n"
+                "Options: 1. pm2  2. systemd  3. docker\n"
+                "(default: pm2)",
                 {"step": "need_process_manager", "ctx_partial": {
                     "github_url": ctx.github_url, "stack": ctx.stack,
                     "port": ctx.port, "domain": ctx.domain,
-                }, "prefill": pf, "agent": "deployment", "default_pm": default}
+                    "app_type": ctx.app_type,
+                }, "prefill": pf, "agent": "deployment"}
             )
 
         # ── Branch selection ───────────────────────────────────────────
@@ -334,6 +352,7 @@ class DeploymentAgent:
                     "github_url": ctx.github_url, "stack": ctx.stack,
                     "port": ctx.port, "domain": ctx.domain,
                     "process_manager": ctx.process_manager,
+                    "app_type": ctx.app_type,
                 }, "branches": branches, "prefill": pf, "agent": "deployment"}
             )
 
@@ -360,6 +379,7 @@ class DeploymentAgent:
                         "port": ctx.port, "domain": ctx.domain,
                         "process_manager": ctx.process_manager,
                         "branch": ctx.branch,
+                        "app_type": ctx.app_type,
                     }, "prefill": pf, "agent": "deployment"}
                 )
         else:
@@ -393,6 +413,7 @@ class DeploymentAgent:
                     "port": ctx.port, "domain": ctx.domain,
                     "process_manager": ctx.process_manager,
                     "branch": ctx.branch,
+                    "app_type": ctx.app_type,
                 }, "env_example_vars": env_example_vars, "prefill": pf, "agent": "deployment"}
             )
 
@@ -409,11 +430,12 @@ class DeploymentAgent:
             "domain":          ctx.domain,
             "app_name":        ctx.app_name,
             "app_path":        ctx.app_path,
+            "app_type":        ctx.app_type,
             "env_vars":        ctx.env_vars,
             "process_manager": ctx.process_manager,
             "branch":          ctx.branch,
         }
-        with open("deployment_context.json", "w") as f:
+        with open(_DEPLOYMENT_CONTEXT_FILE, "w") as f:
             json.dump(data, f, indent=2)
         logger.info("[CONTEXT] Saved to deployment_context.json")
 
@@ -442,39 +464,37 @@ class DeploymentAgent:
 
     def _step_clone(self, ctx: DeploymentContext) -> None:
         logger.info("[STEP 1/5] Clone")
-        self._run(
-            f"sudo mkdir -p {ctx.app_path} && "
-            f"sudo chown -R $(whoami):$(id -gn) {ctx.app_path}"
-        )
 
-        # Build authenticated clone URL.
-        # Priority: 1) token passed from frontend/config
-        #           2) ~/.github_token file on the remote server
-        #           3) plain HTTPS (public repos only)
+        # Build authenticated clone URL
         from app.core.config import settings
         token = getattr(self, '_github_token', None) or settings.GITHUB_TOKEN
-
         if not token:
-            # Try reading ~/.github_token from the remote server
             result = self._inspect("cat ~/.github_token 2>/dev/null")
             if result.strip() and "COMMAND DID NOT SUCCEED" not in result:
                 token = result.strip()
 
         repo_path = ctx.github_url.replace("https://", "")
-        if token:
-            clone_url = f"https://{token}@{repo_path}"
-        else:
-            logger.warning(
-                "No GitHub token found. Attempting unauthenticated clone — "
-                "this will fail for private repos. "
-                "Add token to ~/.github_token on the server or set GITHUB_TOKEN in .env"
-            )
-            clone_url = ctx.github_url
+        clone_url = f"https://{token}@{repo_path}" if token else ctx.github_url
+        if not token:
+            logger.warning("No GitHub token — attempting unauthenticated clone.")
 
-        self._run(
-            f"GIT_TERMINAL_PROMPT=0 git clone --branch {ctx.branch} --single-branch "
-            f"{clone_url} {ctx.app_path}"
+        # Check if a valid git repo already exists at this exact path
+        git_code, _, _ = self.executor.execute(
+            f"git --git-dir={ctx.app_path}/.git rev-parse --git-dir 2>/dev/null"
         )
+        if git_code == 0:
+            logger.info(f"[CLONE] Repo exists at {ctx.app_path} — pulling latest")
+            self._run(f"git -C {ctx.app_path} pull")
+        else:
+            # Wipe (with sudo since /opt is root-owned) then clone fresh.
+            # Do NOT pre-create the folder — git clone creates it itself.
+            logger.info(f"[CLONE] Fresh clone into {ctx.app_path}")
+            self._run(f"sudo rm -rf {ctx.app_path}")
+            self._run(
+                f"GIT_TERMINAL_PROMPT=0 git clone --branch {ctx.branch} --single-branch "
+                f"{clone_url} {ctx.app_path}"
+            )
+
         self._run(f"sudo chown -R $(whoami):$(id -gn) {ctx.app_path}")
         files = self._inspect(f"ls {ctx.app_path}")
         if not files.strip() or "COMMAND DID NOT SUCCEED" in files:
@@ -540,7 +560,7 @@ class DeploymentAgent:
 
             if pm == "pm2":
                 self.pm2.install()
-                self.pm2.start(app_name=app_name, script=entry, working_directory=app_path)
+                self.pm2.start(app_name=app_name, script=entry, working_directory=app_path, port=port)
                 self.pm2.save()
                 ctx.port = self._detect_actual_port(app_name, ctx.port)
 
@@ -652,13 +672,15 @@ class DeploymentAgent:
         )
         logger.info(f"  [DOCKER] Container {ctx.app_name} running on port {ctx.port}")
 
-    def _check_port_conflict(self, port: str) -> None:
+    def _check_port_conflict(self, port: str, app_name: str = "") -> str:
         """
         Checks if the given port is already in use on the server.
-        If occupied, shows what process is using it and asks the user to confirm or change.
-        Updates ctx.port if user provides a different port.
+        - If occupied by the same app (re-deployment): stops it automatically and continues.
+        - If occupied by a different process: raises NeedsInputError to ask the user.
         Returns the confirmed port.
         """
+        from app.services.conversation_service import NeedsInputError
+
         _, ss_out, _ = self.executor.execute(f"ss -tlnp | grep :{port} ")
         if not ss_out.strip():
             logger.info(f"  [PORT CHECK] Port {port} is free.")
@@ -675,22 +697,45 @@ class DeploymentAgent:
             process_name = pname.strip()
 
         logger.warning(f"  [PORT CONFLICT] Port {port} is already in use by '{process_name}' (pid {pid})")
-        print(f"\n  ⚠ Port {port} is already occupied by: {process_name or 'unknown'} (pid={pid or '?'})")
-        print(f"  Full ss output: {ss_out.strip()}")
 
-        answer = input(
-            f"\n[?] Port {port} is in use. Options:\n"
-            f"    1. Enter a different port number\n"
-            f"    2. Press Enter to continue anyway (app may override it from .env)\n"
-            f"    Your choice: "
-        ).strip()
+        # ── Auto-resolve: same app re-deployment ──────────────────────────
+        # If it's a next-server, node, or pm2 process AND we have an app_name,
+        # it's almost certainly the previous deployment of this same app — just kill it.
+        is_node_process = any(
+            kw in process_name.lower()
+            for kw in ("next-server", "node", "npm", "pm2")
+        )
+        if is_node_process and app_name:
+            logger.info(f"  [PORT] Same-app conflict detected — stopping pm2 process '{app_name}' and continuing.")
+            self.executor.execute(f"pm2 delete {app_name} 2>/dev/null || true")
+            self.executor.execute(f"kill -9 {pid} 2>/dev/null || true")
+            return port
 
-        if answer.isdigit():
-            logger.info(f"  [PORT] User switched port from {port} to {answer}")
-            return answer
+        # ── Unknown process — ask user via chat ───────────────────────────
+        pf = getattr(self, '_prefill', {}) or {}
+        port_conflict_answer = pf.get("port_conflict_answer")
+        if port_conflict_answer is not None:
+            if str(port_conflict_answer).isdigit():
+                logger.info(f"  [PORT] User switched port from {port} to {port_conflict_answer}")
+                return str(port_conflict_answer)
+            logger.info(f"  [PORT] User chose to continue with port {port} despite conflict.")
+            return port
 
-        logger.info(f"  [PORT] User chose to continue with port {port} despite conflict.")
-        return port
+        raise NeedsInputError(
+            f"⚠ Port `{port}` is already in use by `{process_name or 'unknown'}` (pid={pid or '?'}).\n"
+            f"Options:\n"
+            f"- Enter a **different port number** to use instead\n"
+            f"- Type `continue` to proceed anyway",
+            {
+                "step": "need_port_conflict",
+                "port": port,
+                "process_name": process_name,
+                "pid": pid,
+                "ctx_partial": (pf.get("ctx_partial") or {}),
+                "prefill": pf,
+                "agent": "deployment",
+            }
+        )
 
     def _detect_actual_port(self, app_name: str, expected_port: str) -> str:
         """After PM2 start, read actual port from logs and ss."""
@@ -741,7 +786,7 @@ class DeploymentAgent:
 
             if pm == "pm2":
                 self.pm2.install()
-                self.pm2.start(app_name=app_name, script=entry, working_directory=app_path)
+                self.pm2.start(app_name=app_name, script=entry, working_directory=app_path, port=port)
                 self.pm2.save()
                 ctx.port = self._detect_actual_port(app_name, ctx.port)
             elif pm == "systemd":
@@ -796,6 +841,47 @@ class DeploymentAgent:
 
     def _step_nginx(self, ctx: DeploymentContext) -> None:
         logger.info("[STEP 4/5] Nginx")
+        from app.services.conversation_service import NeedsInputError
+
+        # ── Ask user if they want nginx configured ─────────────────────────
+        nginx_choice = getattr(self, '_nginx_choice', None) or (self._prefill or {}).get('nginx_choice')
+        if nginx_choice is None:
+            domain_display = ctx.domain if ctx.domain and ctx.domain != "_" else "<server IP>"
+            raise NeedsInputError(
+                f"Do you want me to configure Nginx for **{ctx.app_name}**?\n"
+                f"- Type `yes` to set up Nginx (will proxy `http://{domain_display}` → `localhost:{ctx.port}`)\n"
+                f"- Type `no` to skip (app will only be accessible on port `{ctx.port}` directly)\n"
+                f"- Or type a custom domain/IP if you want to use a different one than `{domain_display}`",
+                {
+                    "step": "need_nginx",
+                    "ctx_partial": {
+                        "github_url":        ctx.github_url,
+                        "stack":             ctx.stack,
+                        "port":              ctx.port,
+                        "domain":            ctx.domain,
+                        "process_manager":   ctx.process_manager,
+                        "branch":            ctx.branch,
+                        "app_name":          ctx.app_name,
+                        "app_path":          ctx.app_path,
+                        "env_vars":          ctx.env_vars,
+                        "app_type":          ctx.app_type,
+                        "deploy_steps_done": True,
+                    },
+                    "prefill": self._prefill or {},
+                    "agent": "deployment",
+                }
+            )
+
+        # User said no — skip nginx entirely
+        if nginx_choice == "no":
+            logger.info("[STEP 4/5] Nginx skipped by user")
+            return
+
+        # User provided a custom domain — override ctx.domain
+        if nginx_choice not in ("yes", "y", "skip"):
+            ctx.domain = nginx_choice
+            self._save_context(ctx)
+
         self.nginx.install()
 
         if ctx.stack in ("react", "vite", "angular"):
@@ -826,6 +912,53 @@ class DeploymentAgent:
     # ── Public entry point ─────────────────────────────────────────────────────
 
     def execute_task(self, query: str) -> str:
+        # ── Fast-path: resuming after need_nginx question ─────────────────
+        # Only skip clone+install if this is a genuine mid-deployment resume:
+        # - nginx_choice must be set (user just answered the nginx question)
+        # - app_path must be a fully resolved absolute path (no $HOME placeholder)
+        # - deploy_steps_done flag must be set (proves clone+install completed this session)
+        pf = getattr(self, '_prefill', None) or {}
+        nginx_only = (
+            pf.get('nginx_choice') is not None
+            and pf.get('app_path')
+            and not pf.get('app_path', '').startswith('$HOME')
+            and pf.get('deploy_steps_done') is True
+        )
+        if nginx_only:
+            logger.info("[PHASE 2] Resuming nginx-only step after user answered nginx question")
+            ctx = DeploymentContext(
+                github_url      = pf.get("github_url", "https://github.com/x/x.git"),
+                stack           = pf.get("stack", ""),
+                port            = str(pf.get("port", "")),
+                domain          = pf.get("domain", "_"),
+                env_vars        = pf.get("env_vars", {}),
+                process_manager = pf.get("process_manager", ""),
+                branch          = pf.get("branch", "main"),
+                app_type        = pf.get("app_type", ""),
+            )
+            # Restore derived fields directly — don't re-derive from github_url
+            ctx.app_name = pf.get("app_name", ctx.app_name)
+            ctx.app_path = pf.get("app_path", ctx.app_path)
+            self._nginx_choice = pf["nginx_choice"]
+            try:
+                self._step_nginx(ctx)
+            except Exception as e:
+                from app.services.conversation_service import NeedsInputError
+                if isinstance(e, NeedsInputError):
+                    raise
+                return f"DEPLOYMENT FAILED at nginx.\n{e}"
+            domain_display = ctx.domain if ctx.domain and ctx.domain != "_" else "<server IP>"
+            is_ip = NginxTool._is_ip(ctx.domain) or ctx.domain in ("_", "", None)
+            protocol = "http" if is_ip else "https"
+            return (
+                f"DEPLOYMENT COMPLETE\n"
+                f"App:    {ctx.app_name}\n"
+                f"URL:    {protocol}://{domain_display}\n"
+                f"Port:   {ctx.port}\n"
+                f"Stack:  {ctx.stack}\n"
+                f"✓ nginx configured"
+            )
+
         # ── Phase 1: collect all required info via one LLM call ───────────
         logger.info("[PHASE 1] Gathering deployment context via LLM...")
         ctx = self._gather_context(query)
@@ -836,7 +969,7 @@ class DeploymentAgent:
         )
 
         # Check port conflict before touching the server
-        ctx.port = self._check_port_conflict(ctx.port)
+        ctx.port = self._check_port_conflict(ctx.port, app_name=ctx.app_name)
 
         # If .env has a PORT key that conflicts with the confirmed port, override it
         if ctx.env_vars:
@@ -907,10 +1040,16 @@ class DeploymentAgent:
             return f"DEPLOYMENT FAILED at install.\n{e}"
 
         # ── Step 4: Nginx ──────────────────────────────────────────────────
+        # Mark that clone+install completed — used by nginx-only fast-path on resume
+        if hasattr(self, '_prefill') and isinstance(self._prefill, dict):
+            self._prefill['deploy_steps_done'] = True
         try:
             self._step_nginx(ctx)
             results.append("✓ nginx")
         except Exception as e:
+            from app.services.conversation_service import NeedsInputError
+            if isinstance(e, NeedsInputError):
+                raise  # let the API layer catch it and ask the user
             logger.error(f"[STEP 4 FAILED] {e}")
             self.alerter.critical(
                 title=f"Deployment FAILED: {ctx.app_name} — nginx error",

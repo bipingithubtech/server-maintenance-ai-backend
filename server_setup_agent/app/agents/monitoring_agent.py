@@ -14,6 +14,7 @@ Covers:
 
 import json
 import re
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
@@ -312,7 +313,8 @@ class MonitoringAgent:
             return m.group(1)
 
         try:
-            with open("deployment_context.json") as f:
+            _ctx_file = Path(__file__).resolve().parent.parent.parent / "deployment_context.json"
+            with open(_ctx_file) as f:
                 ctx = json.load(f)
                 if ctx.get("app_name") == app_name:
                     return ctx.get("port")

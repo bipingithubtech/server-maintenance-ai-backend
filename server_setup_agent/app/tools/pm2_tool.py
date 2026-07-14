@@ -27,16 +27,20 @@ class PM2Tool:
         script: str,
         working_directory: str,
         interpreter: str = "node",
+        port: str = "",
     ) -> str:
         """
         Starts an app with PM2.
         For Next.js apps, use script='npm' and the args 'run start' will be added automatically.
+        If port is provided, it is injected via the PORT env var so Next.js / Node honours it.
         """
+        port_env = f"PORT={port} " if port else ""
+
         # For Next.js: pm2 start npm --name app -- run start
         if script in ("npm", "yarn") or script.endswith("npm"):
             cmd = (
                 f"cd {working_directory} && "
-                f"pm2 start npm --name {app_name} -- run start"
+                f"{port_env}pm2 start npm --name {app_name} -- run start"
             )
         else:
             cmd = (

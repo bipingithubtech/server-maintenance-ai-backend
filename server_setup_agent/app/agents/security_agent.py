@@ -17,6 +17,7 @@ All alerts sent to MS Teams.
 """
 
 import re
+from pathlib import Path
 from typing import Dict, Any, Optional, List
 from loguru import logger
 
@@ -59,7 +60,8 @@ class SecurityAgent:
         """Load deployed app ports from deployment_context.json to whitelist them."""
         try:
             import json as _json
-            with open("deployment_context.json") as f:
+            ctx_file = Path(__file__).resolve().parent.parent.parent / "deployment_context.json"
+            with open(ctx_file) as f:
                 ctx = _json.load(f)
                 port = ctx.get("port")
                 if port:
