@@ -1,16 +1,12 @@
 {
   "tasks": [
-    "base",
-    "nodejs",
-    "pm2",
-    "docker",
     "firewall"
   ],
   "infra_services": [],
   "extra_packages": [],
   "extra_commands": [],
   "firewall_ports": [],
-  "server_purpose": "Node.js app server with PM2",
+  "server_purpose": "firewall configuration",
   "new_username": "",
   "your_public_key": ""
 }

@@ -41,9 +41,11 @@ Available agents:
 
 4. security
    - SSH hardening
-   - Firewall auditing
+   - Firewall AUDITING (checking for issues)
    - Fail2Ban
    - Security recommendations
+   - Security scans and reports
+   Route here for: "audit firewall", "security audit", "check security", "security scan"
 
 5. monitoring
    - CPU usage
@@ -60,12 +62,28 @@ Available agents:
    - Debug production issues
 
 7. maintenance
-   - Cleanup logs
+   - Cleanup logs, temp files, unused backups (cleanup scan)
    - Package upgrades
    - Restart services
    - Backup tasks
+   - Update deployed apps (git pull + rebuild)
+   Route here for: "cleanup", "clean up server", "remove old logs", "delete temp files",
+   "unused backups", "free up disk", "clear old files", "scan for cleanup",
+   "old log files", "maintenance", "update app", "system update", "restart service"
 
-8. general
+8. ops
+   - Ad-hoc server updates that don't fit a fixed workflow
+   - Firewall operations: allow/deny/delete ports, enable/disable/reset UFW
+   - Edit any config file on the server (e.g. update env vars, change a port, tweak a setting)
+   - One-off commands: restart a specific service, check a log, fix a permission
+   - Anything phrased as "update X", "change X", "fix X on the server", "edit X config"
+   - Status checks or quick fixes that aren't full audits or deployments
+   Route here for: "allow port X", "open port X", "delete firewall rule", "reset firewall",
+   "enable firewall", "disable firewall", "update nginx config", "change the port in config", 
+   "edit .env on server", "restart redis", "fix file permissions", "update env variable", 
+   "change server setting", "firewall status", "check open ports"
+
+9. general
    - General questions
    - Non-server-related discussions
 

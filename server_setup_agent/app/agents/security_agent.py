@@ -126,6 +126,39 @@ class SecurityAgent:
 
         return "\n".join(results)
 
+    def add_firewall_ports(self, ports: List[str]) -> str:
+        """
+        Adds specific ports to UFW without resetting.
+        Useful for adding missing ports to an existing firewall config.
+        Example: add_firewall_ports(["80", "443"])
+        """
+        logger.info(f"[SECURITY] Adding firewall ports: {ports}")
+        results = []
+
+        try:
+            for port in ports:
+                self.firewall.allow_port(port)
+                results.append(f"✓ Port {port} allowed")
+        except Exception as e:
+            results.append(f"✗ Failed to add port: {e}")
+            self.alerter.security(
+                title="Failed to add firewall port",
+                server=self.server_label,
+                details=str(e),
+            )
+            return "\n".join(results)
+
+        # Show current status
+        try:
+            status = self.firewall.status()
+            results.append("\nCurrent UFW status:")
+            for line in status.splitlines()[-5:]:  # Show last few lines
+                results.append(f"  {line}")
+        except Exception:
+            pass
+
+        return "\n".join(results)
+
     # ── Task 2: Fail2ban ───────────────────────────────────────────────────────
 
     def setup_fail2ban(self) -> str:

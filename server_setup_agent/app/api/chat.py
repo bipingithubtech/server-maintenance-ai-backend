@@ -80,6 +80,11 @@ def _dispatch(agent_name: str, query: str, request: QueryRequest) -> str:
         agent = TroubleshootingAgent(executor_type=executor_type, executor_config=executor_config, server_label=label)
         return agent.execute_task(query)
 
+    if agent_name == "ops":
+        from app.agents.ops_agent import OpsAgent
+        agent = OpsAgent(executor_type=executor_type, executor_config=executor_config, server_label=label)
+        return agent.execute_task(query)
+
     return f"The '{agent_name}' agent is not yet fully implemented."
 
 
@@ -214,16 +219,15 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
 
     # Inject user's answer into the right prefill field based on step
     if step == "gather":
-        # User answered the clarification question — inject answer into LLM messages and retry
+        # User answered the clarification question — combine original query + answer
+        # so the LLM has all info in a single message and won't ask again.
         original_query = agent_state.get("query", orig_request.get("query", ""))
-        answer = user_answer.strip().lower()
-        if answer in ("yes", "y", "ok", "proceed", "sure"):
-            # Vague answer — retry original query as-is
+        answer = user_answer.strip()
+        if answer.lower() in ("yes", "y", "ok", "proceed", "sure"):
             new_query = original_query
         else:
-            # User gave actual answer — use it as the query
-            new_query = user_answer
-        prefill["_llm_answer"] = user_answer  # pass through so agent can use it
+            new_query = f"{original_query}. {answer}"
+        prefill["_llm_answer"] = user_answer
 
     elif step == "suggestions":
         answer = user_answer.strip().lower()
@@ -381,6 +385,28 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "cleanup_confirm":
+        import json as _json
+        answer = user_answer.strip().lower()
+        if answer not in ("yes", "y"):
+            return QueryResponse(agent=agent_name, reason="Cancelled", result="Cleanup cancelled.")
+        raw_paths = agent_state.get("pending_paths", "[]")
+        try:
+            confirmed_paths = _json.loads(raw_paths)
+        except Exception:
+            confirmed_paths = []
+        prefill["cleanup_confirmed_paths"] = confirmed_paths
+        new_query = orig_request.get("query", "")
+
+    elif step == "ops_confirm_command":
+        pending_command = agent_state.get("pending_command", "")
+        answer = user_answer.strip().lower()
+        if answer in ("yes", "y"):
+            prefill["confirmed_command"] = pending_command
+        else:
+            prefill["confirmed_command"] = None  # user declined — agent will skip it
+        new_query = orig_request.get("query", "")
+
     else:
         # Unknown step — treat as extra info appended to query
         new_query = f"{orig_request.get('query', '')}. {user_answer}"
@@ -411,9 +437,26 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
                 agent._nginx_choice = prefill["nginx_choice"]
             result = agent.execute_task(new_query)
 
+        elif agent_name == "maintenance":
+            from app.agents.maintenance_agent import MaintenanceAgent
+            agent = MaintenanceAgent(executor_type=executor_type, executor_config=executor_config, server_label=label)
+            if prefill.get("cleanup_confirmed_paths") is not None:
+                result = agent._cleanup_remove(prefill["cleanup_confirmed_paths"])
+            else:
+                result = agent.execute_task(new_query)
+
+        elif agent_name == "ops":
+            from app.agents.ops_agent import OpsAgent
+            agent = OpsAgent(executor_type=executor_type, executor_config=executor_config, server_label=label)
+            if prefill.get("confirmed_command") is not None:
+                agent._confirmed_command = prefill["confirmed_command"]
+            elif prefill.get("confirmed_command") is None and step == "ops_confirm_command":
+                # User declined — return cancellation message directly
+                return QueryResponse(agent=agent_name, reason="Cancelled", result="Command skipped by user.")
+            result = agent.execute_task(new_query)
+
         else:
             result = _dispatch(agent_name, new_query, request)
-
         return QueryResponse(agent=agent_name, reason="Resumed conversation", result=result)
 
     except NeedsInputError as nie:

@@ -40,3 +40,39 @@ class FirewallTool:
         if exit_code != 0:
             raise RuntimeError(f"Failed to get UFW status:\n{err}")
         return out
+
+    def allow_ports_batch(self, ports: list) -> str:
+        """Allows multiple ports at once. Returns status after all ports are added."""
+        results = []
+        for port in ports:
+            try:
+                result = self.allow_port(port)
+                results.append(f"Port {port}: OK")
+            except RuntimeError as e:
+                results.append(f"Port {port}: FAILED - {str(e)}")
+        return "\n".join(results)
+
+    def delete_rule(self, port: str, protocol: str = "tcp", action: str = "allow") -> str:
+        """Removes a firewall rule for a specific port."""
+        exit_code, out, err = self.executor.execute(f"sudo ufw delete {action} {port}/{protocol}")
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to delete rule for {port}/{protocol}:\n{err}")
+        return out
+
+    def delete_rules_batch(self, ports: list) -> str:
+        """Removes multiple firewall rules at once."""
+        results = []
+        for port in ports:
+            try:
+                result = self.delete_rule(port)
+                results.append(f"Port {port}: REMOVED")
+            except RuntimeError as e:
+                results.append(f"Port {port}: FAILED - {str(e)}")
+        return "\n".join(results)
+
+    def reset_firewall(self) -> str:
+        """Resets firewall to default state (removes all rules)."""
+        exit_code, out, err = self.executor.execute("sudo ufw --force reset")
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to reset UFW:\n{err}")
+        return out

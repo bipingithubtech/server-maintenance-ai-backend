@@ -73,8 +73,13 @@ class DeploymentContext:
             self._resolve_app_path()
 
     def _resolve_app_path(self) -> None:
-        """Deploy everything to /opt/<app_name> regardless of frontend/backend."""
-        self.app_path = f"/opt/{self.app_name}"
+        """Default deploy path. Always absolute — never $HOME."""
+        if self.app_type == "frontend":
+            self.app_path = f"/opt/ui/{self.app_name}"
+        elif self.app_type == "backend":
+            self.app_path = f"/opt/api/{self.app_name}"
+        else:
+            self.app_path = f"/opt/{self.app_name}"
 
 
 
@@ -84,41 +89,35 @@ Your ONLY job is to extract deployment info from the user message and return it 
 Required fields:
   github_url  - full GitHub HTTPS URL (must start with https://github.com/)
   stack       - one of: react, vite, angular, nextjs, nodejs, nestjs, fastapi, flask, django
-                IMPORTANT: "nextjs" = Next.js (frontend framework). "nestjs" = NestJS (backend Node framework).
-                If user says "next js" for a backend repo, clarify — they likely mean "nestjs".
-  port        - the internal port the app process listens on (NOT 80 or 443 — nginx always listens on 80).
-                For backend stacks (fastapi, flask, django, nodejs, nestjs): this is the app server port
-                  e.g. uvicorn port 8001 → nginx proxies 80 → localhost:8001
-                For frontend stacks (react, vite, angular): this is the Vite/webpack dev server port
-                  (nginx serves static files from /dist, so port is not used in the nginx config,
-                   but still collect it in case the user needs to run the dev server)
+                IMPORTANT: if user says "next js", "nextjs", or "next.js" → use "nextjs".
+                If user says "nestjs" or "nest js" → use "nestjs".
+                If user says "next js frontend" → use "nextjs". Do NOT ask for clarification.
+  port        - the internal port the app process listens on (NOT 80 or 443).
 
-Optional fields (do NOT ask for these if not provided — they can be filled automatically):
-  domain      - domain name or IP address for nginx server_name. If not provided, return "".
-
-Optional:
-  env_vars    - object with KEY: "value" pairs if the app needs a .env file (empty object {} if not needed)
+Optional fields (do NOT ask for these — fill automatically or leave empty):
+  domain      - domain name or IP for nginx server_name. If not provided, return "".
+  env_vars    - object with KEY: "value" pairs if needed (empty object {} if not needed)
 
 Rules:
-- If the user message contains github_url, stack, and port, return JSON immediately — domain is optional.
-- If github_url, stack, or port is missing, return JSON with a "missing" array and a "question" string.
-- NEVER list "domain" as missing — it is optional and will be filled automatically from the server connection.
-- NEVER guess port. If not provided, list it as missing.
+- If github_url, stack, AND port are ALL present in the combined message, return JSON immediately.
+- Only list a field as missing if it is truly absent from the message.
+- NEVER list domain as missing — it is optional.
+- NEVER ask for clarification about nextjs vs nestjs — if user says "next js" use "nextjs".
 - Return ONLY valid JSON. No markdown, no explanation.
 
 Examples:
 
-User: "deploy https://github.com/Org/repo.git stack=nextjs port=5006 domain=192.168.1.10 no-env"
-Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"5006","domain":"192.168.1.10","env_vars":{}}
+User: "deploy https://github.com/Org/repo.git stack nextjs port 3000"
+Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"3000","domain":"","env_vars":{}}
 
-User: "deploy https://github.com/Org/repo.git stack=nextjs port=5006"
-Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"5006","domain":"","env_vars":{}}
+User: "deploy https://github.com/Org/repo.git port 8000 stack next js for frontend"
+Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"8000","domain":"","env_vars":{}}
 
-User: "deploy https://github.com/Org/repo.git stack=nextjs"
+User: "deploy https://github.com/Org/repo.git stack nextjs"
 Response: {"missing":["port"],"question":"What port does the app run on internally? (nginx will proxy port 80 to this)"}
 
-User: "deploy https://github.com/Org/repo.git stack=fastapi port=8000 domain=myapp.com env DATABASE_URL=postgres://localhost/db SECRET_KEY=abc123"
-Response: {"github_url":"https://github.com/Org/repo.git","stack":"fastapi","port":"8000","domain":"myapp.com","env_vars":{"DATABASE_URL":"postgres://localhost/db","SECRET_KEY":"abc123"}}
+User: "deploy https://github.com/Org/repo.git stack fastapi port 8000 domain myapp.com env DATABASE_URL=postgres://localhost/db"
+Response: {"github_url":"https://github.com/Org/repo.git","stack":"fastapi","port":"8000","domain":"myapp.com","env_vars":{"DATABASE_URL":"postgres://localhost/db"}}
 """
 
 
@@ -242,6 +241,8 @@ class DeploymentAgent:
             if pf.get("app_type"):
                 ctx.app_type = pf["app_type"]
                 ctx._resolve_app_path()
+            if pf.get("clone_dir"):
+                ctx.app_path = pf["clone_dir"].rstrip("/")
             if pf.get("process_manager"):
                 ctx.process_manager = pf["process_manager"]
             if pf.get("branch"):
@@ -318,12 +319,25 @@ class DeploymentAgent:
         """
         from app.services.conversation_service import NeedsInputError
 
+        # ── Infer app_type and resolve canonical clone path FIRST ─────────
+        # Must happen before process_manager question so ctx_partial captures
+        # the correct /opt/ui or /opt/api path, not the bare /opt/{app_name}.
+        if not ctx.app_type:
+            if ctx.stack in DeploymentContext.FRONTEND_STACKS or ctx.stack == "nextjs":
+                ctx.app_type = "frontend"
+            elif ctx.stack in DeploymentContext.BACKEND_STACKS:
+                ctx.app_type = "backend"
+
+        if pf.get("clone_dir"):
+            ctx.app_path = pf["clone_dir"].rstrip("/")
+        else:
+            ctx._resolve_app_path()
+            logger.info(f"[DEPLOY] Auto-selected clone_dir: {ctx.app_path}")
+
         # ── Process manager ────────────────────────────────────────────
         stack = ctx.stack
         if pf.get("process_manager"):
             ctx.process_manager = pf["process_manager"]
-        elif stack in ("react", "vite", "angular", "static"):
-            ctx.process_manager = ""  # static sites don't need a process manager
         else:
             raise NeedsInputError(
                 "Which process manager should be used to run the app?\n"
@@ -333,6 +347,7 @@ class DeploymentAgent:
                     "github_url": ctx.github_url, "stack": ctx.stack,
                     "port": ctx.port, "domain": ctx.domain,
                     "app_type": ctx.app_type,
+                    "clone_dir": ctx.app_path,
                 }, "prefill": pf, "agent": "deployment"}
             )
 
@@ -353,6 +368,7 @@ class DeploymentAgent:
                     "port": ctx.port, "domain": ctx.domain,
                     "process_manager": ctx.process_manager,
                     "app_type": ctx.app_type,
+                    "clone_dir": ctx.app_path if ctx.app_path else None,
                 }, "branches": branches, "prefill": pf, "agent": "deployment"}
             )
 
@@ -465,6 +481,14 @@ class DeploymentAgent:
     def _step_clone(self, ctx: DeploymentContext) -> None:
         logger.info("[STEP 1/5] Clone")
 
+        # Resolve $HOME to the actual home directory on the server
+        if "$HOME" in ctx.app_path or ctx.app_path.startswith("~"):
+            _, home_out, _ = self.executor.execute("echo $HOME")
+            home = home_out.strip()
+            if home:
+                ctx.app_path = ctx.app_path.replace("$HOME", home).replace("~", home)
+                logger.info(f"  [CLONE] Resolved app_path to {ctx.app_path}")
+
         # Build authenticated clone URL
         from app.core.config import settings
         token = getattr(self, '_github_token', None) or settings.GITHUB_TOKEN
@@ -486,15 +510,17 @@ class DeploymentAgent:
             logger.info(f"[CLONE] Repo exists at {ctx.app_path} — pulling latest")
             self._run(f"git -C {ctx.app_path} pull")
         else:
-            # Wipe (with sudo since /opt is root-owned) then clone fresh.
-            # Do NOT pre-create the folder — git clone creates it itself.
             logger.info(f"[CLONE] Fresh clone into {ctx.app_path}")
             self._run(f"sudo rm -rf {ctx.app_path}")
+            # Use sudo for clone so /opt paths work regardless of ownership.
+            # Mask the token from sudo's env by passing it inline in the URL.
             self._run(
-                f"GIT_TERMINAL_PROMPT=0 git clone --branch {ctx.branch} --single-branch "
+                f"sudo git clone --config credential.helper='' "
+                f"--branch {ctx.branch} --single-branch "
                 f"{clone_url} {ctx.app_path}"
             )
 
+        # Fix ownership so subsequent non-sudo commands work on the cloned dir
         self._run(f"sudo chown -R $(whoami):$(id -gn) {ctx.app_path}")
         files = self._inspect(f"ls {ctx.app_path}")
         if not files.strip() or "COMMAND DID NOT SUCCEED" in files:
@@ -543,11 +569,35 @@ class DeploymentAgent:
         port     = ctx.port
         pm       = ctx.process_manager
 
-        # ── Static (no process manager) ────────────────────────────────────
+        # ── Static (react / vite / angular) ───────────────────────────────
         if stack in ("react", "vite", "angular"):
             self.pkg.install("nodejs")
             self._run(f"npm install --prefix {app_path}")
             self._run(f"npm run build --prefix {app_path}")
+
+            if pm == "pm2":
+                # Serve the built dist/ folder using the `serve` static server via pm2
+                self._run("sudo npm install -g serve")
+                self.pm2.install()
+                # Find the actual build output folder
+                dist_path = app_path + "/dist"
+                for candidate in ("dist", "build", "out"):
+                    if self._dir_exists(f"{app_path}/{candidate}"):
+                        dist_path = f"{app_path}/{candidate}"
+                        break
+                # pm2 start serve -- -s <dist> -l <port>
+                self.executor.execute(f"pm2 delete {app_name} 2>/dev/null || true")
+                cmd = (
+                    f"cd {app_path} && "
+                    f"pm2 start serve --name {app_name} -- -s {dist_path} -l {port}"
+                )
+                code, out, err = self.executor.execute(cmd)
+                if code != 0:
+                    raise RuntimeError(f"PM2 serve failed:\n{err}\n{out}")
+                self.pm2.save()
+            elif pm == "docker":
+                self._deploy_docker(ctx)
+            # systemd or no pm — nginx will serve the static files directly
             return
 
         # ── Node / Next.js / NestJS ────────────────────────────────────────
@@ -736,108 +786,6 @@ class DeploymentAgent:
                 "agent": "deployment",
             }
         )
-
-    def _detect_actual_port(self, app_name: str, expected_port: str) -> str:
-        """After PM2 start, read actual port from logs and ss."""
-        import time as _t
-        _t.sleep(3)
-
-        _, logs, _ = self.executor.execute(
-            f"pm2 logs {app_name} --lines 30 --nostream --no-color 2>/dev/null"
-        )
-        match = re.search(r'(?:port|PORT|listening)[^\d]*(\d{3,5})', logs, re.IGNORECASE)
-        if match:
-            detected = match.group(1)
-            if detected != expected_port:
-                logger.warning(f"  [PORT] App bound to {detected}, not {expected_port}. Using {detected}.")
-            return detected
-
-        _, ss_out, _ = self.executor.execute("ss -tlnp | grep node")
-        match = re.search(r':(\d{3,5})\s', ss_out)
-        if match:
-            detected = match.group(1)
-            if detected != expected_port:
-                logger.warning(f"  [PORT] ss shows node on {detected}, not {expected_port}. Using {detected}.")
-            return detected
-
-        logger.info(f"  [PORT] Could not auto-detect. Using specified: {expected_port}")
-        return expected_port
-
-    def _step_install(self, ctx: DeploymentContext) -> None:
-        logger.info(f"[STEP 3/5] Install ({ctx.stack} via {ctx.process_manager})")
-        stack    = ctx.stack
-        app_path = ctx.app_path
-        app_name = ctx.app_name
-        port     = ctx.port
-        pm       = ctx.process_manager
-
-        if stack in ("react", "vite", "angular"):
-            self.pkg.install("nodejs")
-            self._run(f"npm install --prefix {app_path}")
-            self._run(f"npm run build --prefix {app_path}")
-            return
-
-        if stack in ("nextjs", "nodejs", "nestjs"):
-            self.pkg.install("nodejs")
-            self._run(f"npm install --prefix {app_path}")
-            if stack in ("nextjs", "nestjs"):
-                self._run(f"npm run build --prefix {app_path}")
-            entry = "npm" if stack == "nextjs" else ("dist/main.js" if stack == "nestjs" else "index.js")
-
-            if pm == "pm2":
-                self.pm2.install()
-                self.pm2.start(app_name=app_name, script=entry, working_directory=app_path, port=port)
-                self.pm2.save()
-                ctx.port = self._detect_actual_port(app_name, ctx.port)
-            elif pm == "systemd":
-                exec_start = (
-                    f"/usr/bin/npm --prefix {app_path} run start"
-                    if stack == "nextjs"
-                    else f"/usr/bin/node {app_path}/{entry}"
-                )
-                self.systemd.create_service_file(
-                    service_name=app_name,
-                    exec_start=exec_start,
-                    working_directory=app_path,
-                )
-                self.systemd.start_service(app_name)
-                self.systemd.enable_service(app_name)
-            elif pm == "docker":
-                self._deploy_docker(ctx)
-
-        elif stack in ("fastapi", "flask", "django"):
-            if not self._file_exists(f"{app_path}/requirements.txt"):
-                raise RuntimeError(f"No requirements.txt found at {app_path}.")
-
-            if pm == "docker":
-                self._deploy_docker(ctx)
-                return
-
-            self.pkg.install("python3-venv")
-            self._run(f"python3 -m venv {app_path}/venv")
-            self._run(f"{app_path}/venv/bin/pip install -r {app_path}/requirements.txt")
-
-            if stack == "fastapi":
-                exec_cmd = f"{app_path}/venv/bin/uvicorn main:app --host 0.0.0.0 --port {port}"
-            elif stack == "flask":
-                exec_cmd = f"{app_path}/venv/bin/python app.py"
-            else:
-                exec_cmd = f"{app_path}/venv/bin/python manage.py runserver 0.0.0.0:{port}"
-
-            if pm == "pm2":
-                self.pm2.install()
-                self.pm2.start(app_name=app_name, script=exec_cmd.split()[0], working_directory=app_path)
-                self.pm2.save()
-            else:
-                self.systemd.create_service_file(
-                    service_name=app_name,
-                    exec_start=exec_cmd,
-                    working_directory=app_path,
-                )
-                self.systemd.start_service(app_name)
-                self.systemd.enable_service(app_name)
-        else:
-            raise RuntimeError(f"Unsupported stack: {stack}")
 
     def _step_nginx(self, ctx: DeploymentContext) -> None:
         logger.info("[STEP 4/5] Nginx")

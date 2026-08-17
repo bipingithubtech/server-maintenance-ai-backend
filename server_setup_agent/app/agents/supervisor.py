@@ -30,6 +30,7 @@ AgentRoute = Literal[
     "monitoring",
     "troubleshooting",
     "maintenance",
+    "ops",
     "general"
 ]
 

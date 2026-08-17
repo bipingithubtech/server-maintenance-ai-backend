@@ -14,10 +14,13 @@ def register_credentials(
     Register server credentials that must NEVER appear in LLM input/output.
     Call this once per request, before the agent is invoked.
     Clears the previous request's values first.
+
+    NOTE: host and username are NOT treated as secrets — they appear legitimately
+    in paths, commands and logs. Only password and key_filename are scrubbed.
     """
     global _REGISTERED_SECRETS
     _REGISTERED_SECRETS = [
-        s for s in [host, username, password, key_filename]
+        s for s in [password, key_filename]
         if s  # skip None / empty
     ]
 

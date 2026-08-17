@@ -2,9 +2,12 @@
 MaintenanceAgent — Routine server and app maintenance.
 
 Tasks:
+  execute_task(query)      — LLM intent router: maps free-text → right method
   update_app(app_name)     — git pull → rebuild → restart (PM2/systemd/docker)
   rotate_logs(app_name)    — truncate large logs, flush PM2 logs
   clear_disk()             — remove npm/pip/docker cache, free disk space
+  cleanup_scan()           — identify old logs, temp files, unused backups;
+                             confirm with user before removing anything
   restart_service(name)    — restart PM2 app / systemd service / docker container
   system_update()          — apt-get update + upgrade
   full_maintenance()       — runs all tasks in sequence
@@ -17,12 +20,16 @@ import re
 from typing import Dict, Any, Optional, List
 from loguru import logger
 
+from langchain_core.messages import SystemMessage, HumanMessage
+
 from app.executors.executor_factory import ExecutorFactory
 from app.tools.linux_tool import LinuxTool
 from app.tools.package_tool import PackageTool
 from app.tools.pm2_tool import PM2Tool
 from app.tools.systemd_tool import SystemdTool
 from app.services.teams_alert_service import TeamsAlerter
+from app.services.conversation_service import NeedsInputError
+from app.services.llm_service import get_llm
 
 
 class MaintenanceAgent:
@@ -215,9 +222,13 @@ class MaintenanceAgent:
                 details=summary,
             )
             return summary
+
+        # ── Non-docker: rebuild ────────────────────────────────────────────
+        stack = self._detect_stack(app_path)
+        try:
+            if stack in ("nodejs", "nextjs", "nestjs"):
                 self._run(f"npm install --prefix {app_path}")
                 if stack in ("nextjs", "nestjs"):
-                    # Clear old build first
                     self.executor.execute(f"rm -rf {app_path}/.next {app_path}/dist 2>/dev/null")
                     self._run(f"npm run build --prefix {app_path}")
                 results.append(f"✓ rebuild: npm ({stack})")
@@ -225,6 +236,9 @@ class MaintenanceAgent:
             elif stack in ("fastapi", "flask", "django", "python"):
                 self._run(f"{app_path}/venv/bin/pip install -r {app_path}/requirements.txt")
                 results.append("✓ rebuild: pip install")
+
+            else:
+                results.append(f"⚠ rebuild: unknown stack '{stack}', skipped")
 
         except Exception as e:
             results.append(f"✗ rebuild failed: {e}")
@@ -238,7 +252,7 @@ class MaintenanceAgent:
         # ── restart ────────────────────────────────────────────────────────
         pm = self._detect_process_manager(app_name)
         try:
-            result = self.restart_service(app_name, pm)
+            self.restart_service(app_name, pm)
             results.append(f"✓ restart ({pm}): done")
         except Exception as e:
             results.append(f"✗ restart failed: {e}")
@@ -359,7 +373,175 @@ class MaintenanceAgent:
 
         return "\n".join(results)
 
-    # ── Task 4: Restart service ────────────────────────────────────────────────
+    # ── Task 4: Cleanup scan ──────────────────────────────────────────────────
+
+    def cleanup_scan(self, confirmed_paths: Optional[List[str]] = None) -> str:
+        """
+        Two-phase safe cleanup:
+
+        Phase 1 (scan): Finds cleanup candidates across these categories:
+          - Rotated / compressed logs  (/var/log/**/*.gz, *.1, *.2 etc.)
+          - Orphaned temp files        (/tmp files older than 7 days)
+          - Unused backup files        (*.bak, *.bak.*, *.orig, *.old outside /opt apps)
+          - Large log files            (/var/log files > 100 MB)
+          - PM2 log archives           (~/.pm2/logs/*.gz)
+
+        Phase 2 (remove): Only runs if caller passes confirmed_paths.
+          Deletes exactly those paths, one by one, logging each.
+          Returns a before/after disk usage summary.
+        """
+        logger.info("[MAINTENANCE] Running cleanup scan")
+
+        # ── Phase 2: user confirmed — delete the agreed list ──────────────
+        if confirmed_paths is not None:
+            return self._cleanup_remove(confirmed_paths)
+
+        # ── Phase 1: scan and collect candidates ──────────────────────────
+        candidates: List[Dict] = []  # {category, path, size_mb}
+
+        def _collect(category: str, cmd: str) -> None:
+            """Run a find/stat command and parse 'SIZE PATH' lines."""
+            out, _ = self._exec(cmd)
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    size_bytes = int(parts[0])
+                    path = parts[1].strip()
+                    candidates.append({
+                        "category": category,
+                        "path": path,
+                        "size_mb": round(size_bytes / 1024 / 1024, 2),
+                    })
+                except ValueError:
+                    continue
+
+        # Rotated / compressed log files
+        _collect(
+            "rotated log",
+            "find /var/log -type f \\( -name '*.gz' -o -name '*.1' -o -name '*.2' "
+            "-o -name '*.3' -o -name '*.4' -o -name '*.old' \\) "
+            "-printf '%s %p\\n' 2>/dev/null",
+        )
+
+        # Large active log files (> 100 MB)
+        _collect(
+            "large log (>100MB)",
+            "find /var/log -type f -size +100M -printf '%s %p\\n' 2>/dev/null",
+        )
+
+        # Old temp files (not accessed in 7+ days)
+        _collect(
+            "old temp file (7d+)",
+            "find /tmp -type f -atime +7 -printf '%s %p\\n' 2>/dev/null",
+        )
+
+        # Backup files outside /opt app dirs (*.bak, *.bak.NNN, *.orig, *.old)
+        _collect(
+            "unused backup",
+            "find /etc /home /root -maxdepth 5 -type f "
+            "\\( -name '*.bak' -o -name '*.bak.*' -o -name '*.orig' -o -name '*.old' \\) "
+            "-printf '%s %p\\n' 2>/dev/null",
+        )
+
+        # OpsAgent backup files from file edits (*.bak.<timestamp> on config files)
+        _collect(
+            "ops backup",
+            "find /etc -type f -name '*.bak.[0-9]*' -printf '%s %p\\n' 2>/dev/null",
+        )
+
+        # PM2 archived logs
+        pm2_log_dir_out, _ = self._exec("echo ~/.pm2/logs")
+        pm2_log_dir = pm2_log_dir_out.strip()
+        if pm2_log_dir:
+            _collect(
+                "PM2 log archive",
+                f"find {pm2_log_dir} -type f -name '*.gz' -printf '%s %p\\n' 2>/dev/null",
+            )
+
+        # ── Nothing found ──────────────────────────────────────────────────
+        if not candidates:
+            return "✅ Cleanup scan complete — no cleanup candidates found. Server looks clean."
+
+        # ── Build human-readable report ────────────────────────────────────
+        total_mb = sum(c["size_mb"] for c in candidates)
+
+        # Group by category
+        by_category: Dict[str, List[Dict]] = {}
+        for c in candidates:
+            by_category.setdefault(c["category"], []).append(c)
+
+        lines = [
+            f"🔍 Cleanup scan found **{len(candidates)} candidate(s)** "
+            f"totalling ~{total_mb:.1f} MB:\n"
+        ]
+        for cat, items in by_category.items():
+            cat_mb = sum(i["size_mb"] for i in items)
+            lines.append(f"**{cat}** ({len(items)} file(s), ~{cat_mb:.1f} MB)")
+            for item in items[:10]:  # cap per-category preview at 10 lines
+                lines.append(f"  • {item['path']}  ({item['size_mb']} MB)")
+            if len(items) > 10:
+                lines.append(f"  … and {len(items) - 10} more")
+            lines.append("")
+
+        # Serialize paths list so the resume handler can pass it back
+        path_list = json.dumps([c["path"] for c in candidates])
+        lines.append(
+            f"⚠️  Reply **yes** to delete all {len(candidates)} file(s) "
+            f"and recover ~{total_mb:.1f} MB, or **no** to cancel."
+        )
+
+        raise NeedsInputError(
+            "\n".join(lines),
+            {
+                "step": "cleanup_confirm",
+                "agent": "maintenance",
+                "pending_paths": path_list,   # JSON-encoded list for safe transport
+            },
+        )
+
+    def _cleanup_remove(self, paths: List[str]) -> str:
+        """Delete a pre-approved list of files and report results."""
+        logger.info(f"[MAINTENANCE] Removing {len(paths)} confirmed cleanup file(s)")
+        removed, failed = [], []
+
+        for path in paths:
+            # Safety guardrail: never delete anything outside known safe prefixes
+            safe_prefixes = ("/var/log/", "/tmp/", "/etc/", "/home/", "/root/",
+                             "/opt/", "/root/.pm2/logs/")
+            if not any(path.startswith(p) for p in safe_prefixes):
+                failed.append(f"⛔ SKIPPED (unsafe path): {path}")
+                continue
+
+            code, _, err = self.executor.execute(f"sudo rm -f {path} 2>&1")
+            if code == 0:
+                removed.append(f"✓ removed: {path}")
+                logger.info(f"  [CLEANUP] removed {path}")
+            else:
+                failed.append(f"✗ failed: {path}  ({err.strip()})")
+                logger.warning(f"  [CLEANUP] failed to remove {path}: {err.strip()}")
+
+        # Report disk delta
+        disk_after = self._get_disk_free_pct()
+        lines = [
+            f"🧹 Cleanup complete — {len(removed)} removed, {len(failed)} failed.",
+            f"Disk usage now: {disk_after:.0f}%",
+            "",
+        ] + removed + ([""] + failed if failed else [])
+
+        summary = "\n".join(lines)
+        self.alerter.info(
+            title="Cleanup scan completed",
+            server=self.server_label,
+            details=f"{len(removed)} files removed, {len(failed)} failed.",
+        )
+        return summary
+
+    # ── Task 5: Restart service ────────────────────────────────────────────────
 
     def restart_service(self, name: str, manager: Optional[str] = None) -> str:
         """
@@ -392,7 +574,7 @@ class MaintenanceAgent:
         else:
             raise RuntimeError(f"Cannot detect process manager for '{name}'. Specify: pm2, systemd, or docker.")
 
-    # ── Task 5: System update ──────────────────────────────────────────────────
+    # ── Task 6: System update ─────────────────────────────────────────────────
 
     def system_update(self) -> str:
         """
@@ -423,7 +605,136 @@ class MaintenanceAgent:
         )
         return summary
 
-    # ── Task 6: Full maintenance ───────────────────────────────────────────────
+    # ── Task 7: execute_task — LLM intent router ─────────────────────────────
+
+    # System prompt used to classify the user's intent into one structured action
+    _INTENT_PROMPT = """You are a maintenance dispatcher for a Linux server.
+Parse the user's request and return a single JSON object with:
+  "action"   : one of update_app | rotate_logs | clear_disk | cleanup_scan |
+                restart_service | system_update | full_maintenance
+  "app_name" : string (only for update_app, rotate_logs, restart_service — null otherwise)
+  "reason"   : one sentence explaining your choice
+
+Rules:
+- update_app      → user wants to pull latest code / redeploy a named app
+- rotate_logs     → user wants to flush, rotate, or trim logs
+- clear_disk      → user wants to free disk space via cache purge (NOT file deletion)
+- cleanup_scan    → user wants to find and remove old logs, temp files, unused backups
+- restart_service → user wants to restart a named service/app
+- system_update   → user wants apt-get update/upgrade or OS package updates
+- full_maintenance → user wants "full maintenance", "everything", or "all tasks"
+
+If the user names a specific app/service, set app_name to that name exactly.
+If no app is named, set app_name to null.
+
+Return ONLY valid JSON. No markdown, no explanation.
+
+Examples:
+User: "update my-api"
+→ {"action":"update_app","app_name":"my-api","reason":"User wants to update the my-api app."}
+
+User: "restart nginx"
+→ {"action":"restart_service","app_name":"nginx","reason":"User wants to restart nginx."}
+
+User: "free up some disk space"
+→ {"action":"clear_disk","app_name":null,"reason":"User wants to purge caches to free disk."}
+
+User: "remove old logs and temp files"
+→ {"action":"cleanup_scan","app_name":null,"reason":"User wants to scan and remove old files."}
+
+User: "run full maintenance"
+→ {"action":"full_maintenance","app_name":null,"reason":"User wants all maintenance tasks run."}
+"""
+
+    def execute_task(self, query: str) -> str:
+        """
+        LLM-powered intent router.
+
+        Classifies the user's free-text query into one of the concrete
+        maintenance actions, then calls the right method directly.
+        Falls back to a safe "unknown intent" message if classification fails.
+        """
+        llm = get_llm()
+
+        # ── Classify intent ────────────────────────────────────────────────
+        try:
+            response = llm.invoke([
+                SystemMessage(content=self._INTENT_PROMPT),
+                HumanMessage(content=query),
+            ])
+            raw = response.content.strip()
+            # Strip markdown fences if the LLM wraps output
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            intent = json.loads(raw)
+        except Exception as exc:
+            logger.warning(f"[MAINTENANCE] Intent classification failed: {exc}")
+            intent = {"action": "unknown", "app_name": None}
+
+        action   = intent.get("action", "unknown")
+        app_name = intent.get("app_name") or None
+        reason   = intent.get("reason", "")
+        logger.info(f"[MAINTENANCE] Intent → action={action!r} app={app_name!r}  ({reason})")
+
+        # ── Dispatch ────────────────────────────────────────────────────────
+        if action == "update_app":
+            if not app_name:
+                # Try to discover all PM2 apps and update them all
+                out, _ = self._exec("pm2 jlist 2>/dev/null")
+                try:
+                    apps = json.loads(out)
+                    names = [a.get("name") for a in apps if a.get("name")]
+                except Exception:
+                    names = []
+                if not names:
+                    return (
+                        "I couldn't find any running apps to update. "
+                        "Please specify the app name, e.g. 'update my-app'."
+                    )
+                results = []
+                for name in names:
+                    results.append(f"── {name} ──────────")
+                    results.append(self.update_app(name))
+                return "\n".join(results)
+            return self.update_app(app_name)
+
+        elif action == "rotate_logs":
+            return self.rotate_logs(app_name)
+
+        elif action == "clear_disk":
+            return self.clear_disk()
+
+        elif action == "cleanup_scan":
+            return self.cleanup_scan()
+
+        elif action == "restart_service":
+            if not app_name:
+                return (
+                    "Please tell me which service to restart, "
+                    "e.g. 'restart nginx' or 'restart my-app'."
+                )
+            return self.restart_service(app_name)
+
+        elif action == "system_update":
+            return self.system_update()
+
+        elif action == "full_maintenance":
+            return self.full_maintenance()
+
+        else:
+            return (
+                f"I'm not sure what maintenance task you need. I can help with:\n"
+                f"• **update app** — git pull + rebuild + restart a deployed app\n"
+                f"• **rotate logs** — flush PM2 / nginx / journalctl logs\n"
+                f"• **clear disk** — purge npm, pip, docker, apt caches\n"
+                f"• **cleanup scan** — find and safely remove old logs, temp files, backups\n"
+                f"• **restart service** — restart any PM2 app, systemd service, or container\n"
+                f"• **system update** — apt-get update + upgrade\n"
+                f"• **full maintenance** — run all of the above\n\n"
+                f"What would you like to do?"
+            )
+
+    # ── Task 8: Full maintenance ───────────────────────────────────────────────
 
     def full_maintenance(self, app_names: Optional[List[str]] = None) -> str:
         """

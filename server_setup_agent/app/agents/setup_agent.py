@@ -525,6 +525,13 @@ class SetupAgent:
         self._run("sudo apt-get upgrade -y")
         self._run("sudo apt-get install -y curl git wget unzip build-essential software-properties-common")
 
+    def _do_app_dirs(self):
+        """Create standard app directories: /opt/ui and /opt/api."""
+        logger.info("[SETUP] Creating app directories (/opt/ui, /opt/api)")
+        self._run("sudo mkdir -p /opt/ui /opt/api")
+        self._run("sudo chown $(whoami):$(id -gn) /opt/ui /opt/api")
+        logger.info("[SETUP] App directories ready: /opt/ui, /opt/api")
+
     def _do_nginx(self):
         logger.info("[SETUP] Nginx")
         self.nginx.install()
@@ -553,7 +560,7 @@ class SetupAgent:
         """
         Dynamic firewall setup:
           - Detects the ACTUAL ssh port in use (instead of assuming 22)
-          - Only opens 80/443 if nginx is part of this setup
+          - Always opens 80/443 for web traffic (production best practice)
           - Only opens infra service ports if those services were requested
             (note: infra containers are bound to 127.0.0.1 only, so this is
              defense-in-depth, not strictly required for them to work)
@@ -570,10 +577,8 @@ class SetupAgent:
         self.executor.execute("sudo ufw default deny incoming")
         self.executor.execute("sudo ufw default allow outgoing")
 
-        ports_to_open = {ssh_port}
-
-        if "nginx" in ctx.tasks:
-            ports_to_open.update(["80", "443"])
+        # Always open SSH, HTTP, HTTPS for any production server
+        ports_to_open = {ssh_port, "80", "443"}
 
         infra_ports = {"redis": "6379", "postgres": "5432", "mysql": "3306", "mongodb": "27017"}
         for svc in ctx.infra_services:
@@ -720,7 +725,20 @@ class SetupAgent:
                 continue
 
             definition = infra_definitions[svc]
+            container_name = definition["container_name"]
             port = definition["internal_port"]
+
+            # Check for an existing container (running OR stopped) before creating one
+            out, _ = self._exec(f"docker ps -a --filter name=^{container_name}$ --format '{{{{.Status}}}}'")
+            if out.strip():
+                if "up" in out.lower():
+                    logger.info(f"[SETUP] {svc} already running — skipping")
+                    connection_info[svc] = {"port": port, "status": "already running"}
+                else:
+                    logger.info(f"[SETUP] {svc} exists but stopped — starting existing container")
+                    self._exec(f"docker start {container_name}")
+                    connection_info[svc] = {"port": port, "status": "restarted existing container"}
+                continue
 
             # Bind only to localhost — nginx/app code connects via 127.0.0.1, never external
             ports = {f"127.0.0.1:{port}": port}
@@ -835,7 +853,14 @@ class SetupAgent:
             pass  # extra_packages will be shown below
 
         if not tasks_to_run and not infra_to_deploy and not ctx.extra_packages:
-            return "SETUP COMPLETE\n\nAll requested components are already installed. Nothing to do."
+            # Even if nothing new needs installing, still configure firewall
+            logger.info("[SETUP] All tasks already done, but ensuring firewall is configured...")
+            try:
+                self._do_firewall(ctx)
+                return "SETUP COMPLETE\n\n✓ All requested components are already installed.\n✓ Firewall configured with ports: 22, 80, 443"
+            except Exception as e:
+                logger.error(f"[SETUP] Firewall config failed: {e}")
+                return f"SETUP COMPLETE (with warning)\n\n✓ All components already installed.\n✗ Firewall config failed: {e}"
 
         # In API mode — skip the confirm prompt, just proceed
         if not getattr(self, '_api_mode', False):
@@ -934,6 +959,13 @@ class SetupAgent:
                 results.append(f"✓ custom commands: {len(ctx.extra_commands)} ran")
             except Exception as e:
                 results.append(f"✗ custom commands: {e}")
+
+        # Always create standard app directories
+        try:
+            self._do_app_dirs()
+            results.append("✓ app directories (~/ui, ~/api)")
+        except Exception as e:
+            results.append(f"✗ app directories: {e}")
 
         summary = "\n".join(results)
         failed  = [r for r in results if r.startswith("✗")]
