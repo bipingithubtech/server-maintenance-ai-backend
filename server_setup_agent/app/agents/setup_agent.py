@@ -533,9 +533,75 @@ class SetupAgent:
         logger.info("[SETUP] App directories ready: /opt/ui, /opt/api")
 
     def _do_nginx(self):
-        logger.info("[SETUP] Nginx")
+        logger.info("[SETUP] Nginx & Certbot")
+        # Install nginx
         self.nginx.install()
         self.nginx.start()
+        
+        # Install certbot for Let's Encrypt SSL cert automation
+        logger.info("[SETUP] Installing Certbot for Let's Encrypt SSL automation")
+        self._run("sudo apt-get install -y certbot python3-certbot-nginx")
+        
+        # Create certbot webroot directory for ACME challenges
+        self._run("sudo mkdir -p /var/www/certbot")
+        self._run("sudo chmod 755 /var/www/certbot")
+        
+        # Generate Diffie-Hellman parameter for stronger SSL/TLS
+        # This takes a minute or two but significantly improves security
+        logger.info("[SETUP] Generating DH parameters for SSL/TLS (this may take 1-2 minutes)")
+        self._run("sudo mkdir -p /etc/nginx/ssl")
+        self._run("sudo openssl dhparam -out /etc/nginx/ssl/dhparam.pem 2048")
+        self._run("sudo chmod 644 /etc/nginx/ssl/dhparam.pem")
+        
+        # Set up automatic cert renewal with systemd timer
+        self._setup_cert_auto_renewal()
+        
+        logger.info("[SETUP] Certbot installed and configured")
+
+    def _setup_cert_auto_renewal(self):
+        """
+        Set up systemd timer for automatic Certbot certificate renewal.
+        Runs 'certbot renew' daily, with nginx reload on success.
+        """
+        logger.info("[SETUP] Configuring automatic certificate renewal")
+        
+        # Create systemd timer service for cert renewal (runs daily at 2 AM)
+        timer_unit = """[Unit]
+Description=Certbot Let's Encrypt Auto-renewal Timer
+After=network-online.target
+Wants=network-online.target
+
+[Timer]
+OnCalendar=daily
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+        
+        timer_service = """[Unit]
+Description=Certbot Let's Encrypt Auto-renewal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --quiet --post-hook "systemctl reload nginx"
+StandardOutput=journal
+StandardError=journal
+"""
+        
+        # Write timer and service files
+        self._run("sudo tee /etc/systemd/system/certbot-renewal.timer > /dev/null << 'EOF'\n" + timer_unit + "EOF")
+        self._run("sudo tee /etc/systemd/system/certbot-renewal.service > /dev/null << 'EOF'\n" + timer_service + "EOF")
+        
+        # Enable and start the timer
+        self._run("sudo systemctl daemon-reload")
+        self._run("sudo systemctl enable certbot-renewal.timer")
+        self._run("sudo systemctl start certbot-renewal.timer")
+        
+        logger.info("[SETUP] Certbot auto-renewal timer configured (daily at 2 AM)")
 
     def _do_docker(self):
         logger.info("[SETUP] Docker")

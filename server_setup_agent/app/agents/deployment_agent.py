@@ -433,12 +433,34 @@ class DeploymentAgent:
                 }, "env_example_vars": env_example_vars, "prefill": pf, "agent": "deployment"}
             )
 
+        # ── Domain for Nginx (ask explicitly) ──────────────────────────
+        if pf.get("domain") and pf["domain"] not in ("_", "", "none"):
+            # User provided explicit domain
+            ctx.domain = pf["domain"]
+        else:
+            # Ask user for domain/IP
+            raise NeedsInputError(
+                "What domain or IP should this app use for Nginx?\n"
+                "Examples:\n"
+                "  - Domain: pm.meetri.in (will use HTTPS with SSL)\n"
+                "  - IP: 192.168.1.1 (will use HTTP only)\n"
+                "  - Skip: just press Enter to use server default\n"
+                "Enter domain/IP:",
+                {"step": "need_domain", "ctx_partial": {
+                    "github_url": ctx.github_url, "stack": ctx.stack,
+                    "port": ctx.port,
+                    "process_manager": ctx.process_manager,
+                    "branch": ctx.branch,
+                    "app_type": ctx.app_type,
+                }, "prefill": pf, "agent": "deployment"}
+            )
+
         self._save_context(ctx)
         logger.info(f"[CONTEXT] app={ctx.app_name} stack={ctx.stack} port={ctx.port} branch={ctx.branch}")
         return ctx
 
     def _save_context(self, ctx: DeploymentContext) -> None:
-        """Saves deployment context to deployment_context.json."""
+        """Saves deployment context to deployment_context.json - reference only, no env_vars duplication."""
         data = {
             "github_url":      ctx.github_url,
             "stack":           ctx.stack,
@@ -447,13 +469,32 @@ class DeploymentAgent:
             "app_name":        ctx.app_name,
             "app_path":        ctx.app_path,
             "app_type":        ctx.app_type,
-            "env_vars":        ctx.env_vars,
+            "env_file_path":   f"{ctx.app_path}/.env",
             "process_manager": ctx.process_manager,
             "branch":          ctx.branch,
         }
         with open(_DEPLOYMENT_CONTEXT_FILE, "w") as f:
             json.dump(data, f, indent=2)
-        logger.info("[CONTEXT] Saved to deployment_context.json")
+        logger.info("[CONTEXT] Saved to deployment_context.json (env_vars stored in server .env only)")
+
+    def _read_env_from_server(self, env_file_path: str) -> dict:
+        """Reads environment variables from the server .env file."""
+        try:
+            _, content, err = self.executor.execute(f"cat {env_file_path}")
+            if err or not content:
+                logger.warning(f"Could not read {env_file_path} from server")
+                return {}
+            
+            env_vars = {}
+            for line in content.strip().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    env_vars[key.strip()] = val.strip()
+            return env_vars
+        except Exception as e:
+            logger.error(f"Error reading env from server: {e}")
+            return {}
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -831,6 +872,11 @@ class DeploymentAgent:
             self._save_context(ctx)
 
         self.nginx.install()
+
+        # ── Ensure SSL certificate exists for domain-based deployments ──────
+        if ctx.domain and ctx.domain != "_" and not self.nginx._is_ip(ctx.domain):
+            ssl_status = self.nginx.ensure_ssl_cert(ctx.domain)
+            logger.info(f"SSL cert status: {ssl_status}")
 
         if ctx.stack in ("react", "vite", "angular"):
             # Find the static dist folder

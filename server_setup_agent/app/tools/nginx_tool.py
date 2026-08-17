@@ -53,44 +53,77 @@ class NginxTool:
 
     def ensure_ssl_cert(self, domain: str) -> str:
         """
-        Ensures a TLS certificate exists at /etc/nginx/ssl/.
-        - If sslcert.crt already exists → reuse it, no-op.
-        - Otherwise → generate a self-signed cert for the domain.
-          Self-signed is fine for internal/staging use; swap for a real cert
-          (e.g. Let's Encrypt / your CA) any time by replacing the files.
+        Ensures a Let's Encrypt certificate exists for the domain using Certbot.
+        - If cert already exists at /etc/letsencrypt/live/{{ domain }}/ → reuse it, no-op.
+        - Otherwise → use certbot to issue a per-subdomain Let's Encrypt cert
+          Requires: certbot, python3-certbot-nginx packages installed
+        
         Returns a status string describing what happened.
         """
-        # Create the ssl dir if it doesn't exist
-        self.executor.execute("sudo mkdir -p /etc/nginx/ssl")
+        if not domain or self._is_ip(domain):
+            logger.info(f"Skipping SSL cert for {domain} (IP-based, not domain)")
+            return "SSL cert not needed for IP-based deployments."
 
+        cert_dir = f"/etc/letsencrypt/live/{domain}"
+        
         # Check if cert already exists
-        code, _, _ = self.executor.execute(f"test -f {self.SSL_CERT}")
+        code, _, _ = self.executor.execute(f"test -d {cert_dir}")
         if code == 0:
-            logger.info(f"SSL cert already exists at {self.SSL_CERT} — reusing.")
-            return f"SSL cert already present at {self.SSL_CERT}."
+            logger.info(f"Let's Encrypt cert already exists for {domain}")
+            return f"Let's Encrypt certificate already present for {domain}."
 
-        # Generate self-signed cert (valid 2 years, 2048-bit RSA)
-        logger.info(f"No SSL cert found — generating self-signed cert for {domain}")
+        # Use certbot to issue cert (with --webroot for non-blocking renewal)
+        logger.info(f"Issuing Let's Encrypt cert for domain: {domain}")
+        
+        # Ensure /var/www/certbot exists for ACME challenges
+        self.executor.execute("sudo mkdir -p /var/www/certbot")
+        self.executor.execute("sudo chmod 755 /var/www/certbot")
+        
         cmd = (
-            f"sudo openssl req -x509 -nodes -newkey rsa:2048 "
-            f"-keyout {self.SSL_KEY} "
-            f"-out {self.SSL_CERT} "
-            f"-days 730 "
-            f"-subj \"/CN={domain}/O=Server/C=US\""
+            f"sudo certbot certonly --webroot -w /var/www/certbot "
+            f"-d {domain} -d www.{domain} "
+            f"--non-interactive --agree-tos --email admin@{domain} "
+            f"--expand --keep-until-expiring"
         )
+        
         code, out, err = self.executor.execute(cmd)
         if code != 0:
-            raise RuntimeError(f"Failed to generate SSL certificate:\n{err}")
+            logger.error(f"Certbot failed for {domain}:\n{err}")
+            # Fall back to self-signed if Let's Encrypt fails
+            logger.info(f"Falling back to self-signed cert for {domain}")
+            return self._generate_self_signed_fallback(domain)
+        
+        logger.info(f"Let's Encrypt cert issued for {domain}")
+        return f"Let's Encrypt certificate successfully issued for {domain}."
 
-        # Lock down key permissions
-        self.executor.execute(f"sudo chmod 600 {self.SSL_KEY}")
-        self.executor.execute(f"sudo chmod 644 {self.SSL_CERT}")
-
-        logger.info(f"Self-signed SSL cert generated at {self.SSL_CERT}")
-        return (
-            f"Self-signed SSL certificate generated at {self.SSL_CERT}.\n"
-            f"Replace with a CA-signed cert any time by overwriting those two files."
+    def _generate_self_signed_fallback(self, domain: str) -> str:
+        """
+        Fallback to self-signed cert if Let's Encrypt fails.
+        Useful for staging/internal environments.
+        """
+        cert_dir = f"/etc/letsencrypt/live/{domain}"
+        self.executor.execute(f"sudo mkdir -p {cert_dir}")
+        
+        cert_file = f"{cert_dir}/fullchain.pem"
+        key_file = f"{cert_dir}/privkey.pem"
+        
+        cmd = (
+            f"sudo openssl req -x509 -nodes -newkey rsa:2048 "
+            f"-keyout {key_file} "
+            f"-out {cert_file} "
+            f"-days 365 "
+            f"-subj \"/CN={domain}/O=Server/C=US\""
         )
+        
+        code, out, err = self.executor.execute(cmd)
+        if code != 0:
+            raise RuntimeError(f"Failed to generate self-signed fallback cert:\n{err}")
+        
+        self.executor.execute(f"sudo chmod 644 {key_file}")
+        self.executor.execute(f"sudo chmod 644 {cert_file}")
+        
+        logger.warning(f"Self-signed fallback cert generated at {cert_dir} (not Let's Encrypt)")
+        return f"⚠️ Self-signed certificate generated as fallback for {domain}. Please configure Let's Encrypt properly."
 
     def generate_config(
         self,

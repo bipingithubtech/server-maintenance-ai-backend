@@ -9,6 +9,9 @@ server {
     root  {{ app_path }};
     index index.html;
 
+    # ── Hide Nginx version from headers/error pages ─────────────────────────
+    server_tokens off;
+
     # ── Logging ────────────────────────────────────────────────────────────
     access_log /var/log/nginx/{{ app_name }}.access.log;
     error_log  /var/log/nginx/{{ app_name }}.error.log warn;

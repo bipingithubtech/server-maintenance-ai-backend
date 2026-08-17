@@ -66,6 +66,8 @@ class SecurityAgent:
                 port = ctx.get("port")
                 if port:
                     self.EXPECTED_PORTS = self.EXPECTED_PORTS | {str(port)}
+                # Note: env_vars are no longer stored here (avoided duplication)
+                # They are stored on the server in the path specified by env_file_path
         except Exception:
             pass  # file may not exist — use defaults
 

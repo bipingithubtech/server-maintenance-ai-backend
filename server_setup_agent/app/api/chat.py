@@ -372,6 +372,18 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "need_domain":
+        answer = user_answer.strip()
+        if not answer or answer.lower() in ("skip", "default", ""):
+            # User skipped — use server default or _
+            prefill["domain"] = agent_state.get("ctx_partial", {}).get("domain", "_")
+        else:
+            # User provided domain or IP
+            prefill["domain"] = answer
+        # Merge ctx_partial
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
     elif step == "need_nginx":
         answer = user_answer.strip().lower()
         if answer in ("no", "n", "skip"):
