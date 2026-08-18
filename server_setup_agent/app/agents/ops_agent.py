@@ -192,6 +192,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "configure_ssl",
+            "description": "Configure SSL/HTTPS for a domain using Let's Encrypt. Run this after deployment to set up SSL certificates.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string", "description": "Domain to configure (e.g., 'deploy.meetri.in')"},
+                    "email": {"type": "string", "description": "Email for Let's Encrypt notifications (e.g., 'admin@meetri.in')"},
+                    "renewal_check": {"type": "boolean", "description": "Check existing certificate status before renewal (default: true)"},
+                },
+                "required": ["domain", "email"],
+            },
+        },
+    },
 ]
 
 # Commands that must get explicit user confirmation before execution
@@ -493,6 +509,65 @@ class OpsAgent:
             except Exception as e:
                 logger.error(f"[OPS] NGINX SETUP FAILED: {e}")
                 return f"❌ Nginx setup failed: {e}"
+        
+        if name == "configure_ssl":
+            domain = args["domain"]
+            email = args["email"]
+            renewal_check = args.get("renewal_check", True)
+            
+            logger.info(f"[OPS] CONFIGURE SSL: {domain} (email={email})")
+            
+            try:
+                # Check if cert already exists
+                cert_dir = f"/etc/letsencrypt/live/{domain}"
+                result = self._exec(f"test -d {cert_dir} && echo 'exists' || echo 'not'")
+                
+                if "exists" in result and renewal_check:
+                    logger.info(f"[SSL] Certificate already exists for {domain}, checking renewal...")
+                    renewal_result = self._run_command(f"sudo certbot renew --quiet --no-eff-email 2>/dev/null || true")
+                    return f"✅ Certificate check complete for {domain}.\n{renewal_result}"
+                
+                # Install certbot if not present
+                install_result = self._exec("which certbot || sudo apt-get install -y certbot python3-certbot-nginx")
+                
+                # Configure SSL via certbot using standalone mode (no nginx plugin issues)
+                logger.info(f"[SSL] Requesting Let's Encrypt certificate for {domain}...")
+                certbot_cmd = (
+                    f"sudo certbot certonly --standalone --non-interactive --agree-tos "
+                    f"--email {email} "
+                    f"-d {domain} 2>&1"
+                )
+                result = self._run_command(certbot_cmd)
+                
+                # Check if successful
+                if "Successfully received certificate" in result or "Certificate not yet due for renewal" in result:
+                    logger.info(f"[SSL] Certificate configured successfully for {domain}")
+                    logger.info(f"[SSL] Reloading Nginx to use new certificate...")
+                    
+                    # Reload Nginx to use the certificate
+                    reload_result = self._run_command("sudo systemctl reload nginx")
+                    
+                    return (
+                        f"✅ SSL certificate successfully obtained for {domain}\n"
+                        f"- Cert path: {cert_dir}/fullchain.pem\n"
+                        f"- Key path: {cert_dir}/privkey.pem\n"
+                        f"- Auto-renewal: Enabled\n\n"
+                        f"Your app is now accessible at https://{domain}"
+                    )
+                else:
+                    logger.error(f"[SSL] Certificate configuration may have failed: {result}")
+                    return (
+                        f"⚠️ Certificate configuration for {domain} - check output:\n{result}\n\n"
+                        f"Common issues:\n"
+                        f"- Domain DNS not pointing to this server\n"
+                        f"- Port 80/443 not accessible from the internet\n"
+                        f"- Rate limit exceeded (wait 1 hour and try again)\n\n"
+                        f"For troubleshooting, run: sudo certbot --dry-run -d {domain}"
+                    )
+            
+            except Exception as e:
+                logger.error(f"[SSL] Configuration failed: {e}")
+                return f"❌ SSL configuration failed: {e}\n\nFor debugging, run on server: sudo certbot certonly --standalone -d {domain}"
         
         return f"Unknown tool: {name}"
 

@@ -13,6 +13,12 @@ class PM2Tool:
 
     def install(self) -> str:
         """Installs PM2 globally via npm and updates the daemon."""
+        # Check if PM2 is already installed
+        code, _, _ = self.executor.execute("which pm2")
+        if code == 0:
+            logger.info("✓ PM2 is already installed (skipping installation).")
+            return "PM2 is already installed (skipping)."
+        
         exit_code, out, err = self.executor.execute("sudo npm install -g pm2")
         if exit_code != 0:
             raise RuntimeError(f"Failed to install PM2:\n{err}")

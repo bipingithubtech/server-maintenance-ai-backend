@@ -34,54 +34,24 @@ Available agents:
 3. deployment
    - Deploy an application from a GitHub repo to the server
    - Deploy React/Vite apps, FastAPI apps, Docker applications
-   - Configure Nginx reverse proxy for an app
-   - Configure SSL/TLS for a domain
-   Route here ONLY when there is a GitHub repo URL, an app to deploy, or a domain/SSL to configure.
-   Do NOT route here for "install redis/postgres/nginx/docker" — those go to setup.
+   - ONLY route here if deploying a NEW app from GitHub URL
+   - Do NOT route here for post-deployment Nginx/SSL configuration
+   Route here ONLY when: GitHub repo URL is provided AND app needs to be cloned/deployed
+   Examples: "deploy https://github.com/...", "deploy my app to port 3000"
 
-4. security
-   - SSH hardening
-   - Firewall AUDITING (checking for issues)
-   - Fail2Ban
-   - Security recommendations
-   - Security scans and reports
-   Route here for: "audit firewall", "security audit", "check security", "security scan"
-
-5. monitoring
-   - CPU usage
-   - RAM usage
-   - Disk usage
-   - Service health
-   - Container health
-
-6. troubleshooting
-   - Service failures
-   - Nginx errors
-   - Docker errors
-   - Analyze logs
-   - Debug production issues
-
-7. maintenance
-   - Cleanup logs, temp files, unused backups (cleanup scan)
-   - Package upgrades
-   - Restart services
-   - Backup tasks
-   - Update deployed apps (git pull + rebuild)
-   Route here for: "cleanup", "clean up server", "remove old logs", "delete temp files",
-   "unused backups", "free up disk", "clear old files", "scan for cleanup",
-   "old log files", "maintenance", "update app", "system update", "restart service"
-
-8. ops
+4. ops
    - Ad-hoc server updates that don't fit a fixed workflow
    - Firewall operations: allow/deny/delete ports, enable/disable/reset UFW
    - Edit any config file on the server (e.g. update env vars, change a port, tweak a setting)
    - One-off commands: restart a specific service, check a log, fix a permission
    - Anything phrased as "update X", "change X", "fix X on the server", "edit X config"
    - Status checks or quick fixes that aren't full audits or deployments
+   - POST-DEPLOYMENT NGINX & SSL: Configure Nginx for already-deployed apps, set up SSL certificates
    Route here for: "allow port X", "open port X", "delete firewall rule", "reset firewall",
    "enable firewall", "disable firewall", "update nginx config", "change the port in config", 
    "edit .env on server", "restart redis", "fix file permissions", "update env variable", 
-   "change server setting", "firewall status", "check open ports"
+   "change server setting", "firewall status", "check open ports",
+   "configure nginx", "setup ssl", "enable https", "ssl certificate", "nginx reverse proxy"
 
 9. general
    - General questions

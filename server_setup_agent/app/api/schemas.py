@@ -15,9 +15,11 @@ class ServerCredentials(BaseModel):
     key_filename: Optional[str] = None
     port: int = 22
     github_token: Optional[str] = None  # PAT for cloning private GitHub repos
+    sudo_password: Optional[str] = None  # Password for sudo commands (can be same as password)
 
     @model_validator(mode="after")
     def apply_ssh_defaults(self) -> "ServerCredentials":
+        import os
         if self.executor_type == "ssh":
             if not self.host:
                 self.host = settings.SSH_HOST
@@ -31,6 +33,9 @@ class ServerCredentials(BaseModel):
                     self.key_filename = settings.SSH_KEY_PATH
                 elif settings.SSH_PASSWORD:
                     self.password = settings.SSH_PASSWORD
+            # Load sudo_password from environment if not provided
+            if not self.sudo_password:
+                self.sudo_password = os.getenv("SUDO_PASSWORD")
         return self
 
     def to_config(self) -> Dict[str, Any]:
@@ -40,6 +45,7 @@ class ServerCredentials(BaseModel):
             "password":     self.password,
             "key_filename": self.key_filename,
             "port":         self.port,
+            "sudo_password": self.sudo_password,
         }
 
 

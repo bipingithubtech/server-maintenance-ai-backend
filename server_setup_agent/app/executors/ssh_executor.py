@@ -33,13 +33,15 @@ class SSHExecutor(BaseExecutor):
         username: str,
         password: Optional[str] = None,
         key_filename: Optional[str] = None,
-        port: int = 22
+        port: int = 22,
+        sudo_password: Optional[str] = None
     ):
         self.host = host
         self.username = username
         self.password = password
         self.key_filename = key_filename
         self.port = port
+        self.sudo_password = sudo_password  # Password for sudo commands
         self._local = threading.local()  # per-thread client
 
     def _connect(self) -> paramiko.SSHClient:
@@ -80,6 +82,42 @@ class SSHExecutor(BaseExecutor):
     def _exec(self, client: paramiko.SSHClient, command: str) -> Tuple[int, str, str]:
         """Run a single command with an appropriate timeout."""
         timeout = _pick_timeout(command)
+        
+        # If command uses sudo and sudo_password is available, inject password via stdin
+        if "sudo" in command and self.sudo_password:
+            from loguru import logger
+            logger.info(f"[SSH] ✓ Sudo password available - using stdin injection with PTY")
+            logger.debug(f"[SSH] Original command: {command[:80]}...")
+            
+            # Replace "sudo" with "sudo -S" to read password from stdin
+            command = command.replace("sudo ", "sudo -S ", 1)
+            logger.debug(f"[SSH] Modified command: {command[:80]}...")
+            
+            # Execute command with PTY allocation and write password to stdin
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout, get_pty=True)
+            
+            # Small delay to ensure sudo prompt is ready
+            import time
+            time.sleep(0.1)
+            
+            # Write password and newline
+            stdin.write(f"{self.sudo_password}\n")
+            stdin.flush()
+            
+            stdout.channel.setblocking(True)
+            exit_code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+            
+            # When using PTY, stderr is merged into stdout, so extract actual errors
+            # Remove sudo password prompt from output
+            out = out.replace(f"[sudo] password for {self.username}: ", "")
+            
+            return exit_code, out, err
+        elif "sudo" in command and not self.sudo_password:
+            from loguru import logger
+            logger.warning(f"[SSH] ✗ Command needs sudo but no sudo_password available: {command[:50]}...")
+        
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         stdout.channel.setblocking(True)
         exit_code = stdout.channel.recv_exit_status()

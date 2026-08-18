@@ -183,7 +183,7 @@ async def handle_query(request: QueryRequest):
     except NeedsInputError as nie:
         cid = conversation_store.save({
             "agent_name":  agent_name,
-            "request":     request.model_dump(),
+            "request":     request.model_dump(),  # Store complete request with credentials
             "question":    nie.question,
             "agent_state": nie.state,
         })
@@ -366,9 +366,24 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "need_sudo_password":
+        # User provided their sudo password
+        sudo_password = user_answer.strip()
+        if not sudo_password:
+            return QueryResponse(agent=agent_name, reason="Cancelled", result="Deployment cancelled - no password provided.")
+        
+        # Store in prefill so it's passed to credentials and executor below
+        prefill["sudo_password"] = sudo_password
+        
+        # Merge other context from agent_state
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
     elif step == "need_env":
+        # User answered the .env question
         answer = user_answer.strip().lower()
         if answer in ("no", ""):
+            # User doesn't need .env file
             prefill["env_vars"] = {}
         else:
             import json as _json
@@ -474,7 +489,27 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         new_query = f"{orig_request.get('query', '')}. {user_answer}"
 
     # Rebuild request with updated prefill
+    # IMPORTANT: Preserve credentials from current request if not in original
     creds = request.credentials
+    if not creds and "request" in state:
+        # Restore credentials from original request if stored
+        orig_creds_dict = state.get("request", {}).get("credentials")
+        if orig_creds_dict:
+            from app.api.schemas import ServerCredentials
+            creds = ServerCredentials(**orig_creds_dict)
+            # Re-run validator to ensure sudo_password is loaded from .env
+            creds = creds.model_validate(creds.model_dump())
+    
+    # CRITICAL: Always reload sudo_password from .env if not already set
+    # This ensures sudo_password is available even when resuming conversations
+    if creds and not creds.sudo_password:
+        import os
+        creds.sudo_password = os.getenv("SUDO_PASSWORD")
+    
+    # If user provided sudo_password in prefill, add it to credentials
+    if prefill.get("sudo_password") and creds:
+        creds.sudo_password = prefill["sudo_password"]
+    
     executor_type   = creds.executor_type if creds else "local"
     executor_config = creds.to_config() if creds else {}
     label           = executor_config.get("host", "server")

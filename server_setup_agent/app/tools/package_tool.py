@@ -25,6 +25,10 @@ class PackageTool:
         return "Package lists updated successfully.\n" + stdout
 
     def install(self, package_name: str) -> str:
+        # Check if package is already installed
+        if self.is_installed(package_name):
+            return f"Package {package_name} is already installed."
+        
         exit_code, stdout, stderr = self._apt(
             f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {package_name}",
             f"Failed to install {package_name}"

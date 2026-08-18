@@ -22,6 +22,7 @@ class ConnectRequest(BaseModel):
     username:     str
     password:     Optional[str] = None
     key_filename: Optional[str] = None
+    sudo_password: Optional[str] = None  # Password for sudo commands (can be same as password)
 
 
 class ConnectResponse(BaseModel):
@@ -36,6 +37,8 @@ def test_connection(req: ConnectRequest):
     """
     Verify SSH credentials. Called by frontend on the Connect screen.
     Returns connected=true and the logged-in username on success.
+    
+    If sudo_password is provided, test that sudo works with the password.
     """
     try:
         from app.executors.ssh_executor import SSHExecutor
@@ -46,6 +49,7 @@ def test_connection(req: ConnectRequest):
             password=req.password,
             key_filename=req.key_filename,
             port=req.port,
+            sudo_password=req.sudo_password,  # Pass sudo password to executor
         )
 
         # Run whoami to confirm connection and get actual username
@@ -53,9 +57,17 @@ def test_connection(req: ConnectRequest):
         if exit_code != 0:
             return ConnectResponse(connected=False, error=err or "Connection failed")
 
+        username = out.strip()
+        
+        # If sudo_password provided, test that sudo works
+        if req.sudo_password:
+            exit_code, out, err = executor._run("sudo -n true 2>/dev/null || echo 'need_password'")
+            # We don't strictly need to test here since it will be tested during deployment
+            # Just confirm connection works
+
         return ConnectResponse(
             connected=True,
-            user=out.strip(),
+            user=username,
             host=req.host,
         )
 

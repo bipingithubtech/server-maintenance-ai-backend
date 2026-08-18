@@ -131,6 +131,8 @@ class DeploymentAgent:
     def __init__(self, executor_type: str = "local", executor_config: Dict[str, Any] = None):
         if executor_config is None:
             executor_config = {}
+        self.executor_type   = executor_type  # Store for later use
+        self.executor_config = executor_config  # Store for later use
         self.executor = ExecutorFactory.get_executor(executor_type, **executor_config)
         self.linux    = LinuxTool(self.executor)
         self.pkg      = PackageTool(self.executor)
@@ -546,6 +548,39 @@ class DeploymentAgent:
             json.dump(data, f, indent=2)
         logger.info("[CONTEXT] Saved to deployment_context.json (env_vars stored in server .env only)")
 
+    def _request_ssl_cert(self, domain: str) -> str:
+        """Request SSL certificate from Let's Encrypt using certbot (standalone mode)."""
+        import os
+        
+        # Get default email from environment or use a placeholder
+        email = os.getenv("SSL_EMAIL", "admin@server.local")
+        
+        logger.info(f"[SSL] Requesting certificate for {domain} using email {email}")
+        
+        # Install certbot if not present
+        self._run(f"which certbot || sudo apt-get install -y certbot")
+        
+        # Request certificate in standalone mode (no nginx plugin issues)
+        cert_cmd = (
+            f"sudo certbot certonly --standalone --non-interactive "
+            f"--agree-tos --email {email} "
+            f"-d {domain} 2>&1"
+        )
+        
+        code, out, err = self.executor.execute(cert_cmd)
+        result = out or err
+        
+        if code == 0 or "Successfully received certificate" in result or "not yet due for renewal" in result:
+            logger.info(f"[SSL] Certificate obtained for {domain}")
+            # Reload nginx to use the cert (if nginx_setup was already called)
+            self._run("sudo systemctl reload nginx 2>/dev/null || true")
+            return f"✅ SSL certificate configured for {domain}"
+        else:
+            # Non-critical: SSL failure during deployment should not block
+            logger.warning(f"[SSL] Certificate request failed (non-critical): {result}")
+            return f"⚠️ SSL certificate request failed — configure later with ops agent"
+
+
     def _read_env_from_server(self, env_file_path: str) -> dict:
         """Reads environment variables from the server .env file."""
         try:
@@ -743,6 +778,53 @@ class DeploymentAgent:
         port     = ctx.port
         pm       = ctx.process_manager
 
+        # ── Auto-detect nested app directory ──────────────────────────────
+        # Some repos have structure: repo/ → app_dir/ → package.json
+        # Check if app_path points to parent, and app files are in subdirectory
+        has_app_here = (
+            self._file_exists(f"{app_path}/requirements.txt") or 
+            self._file_exists(f"{app_path}/package.json") or
+            self._file_exists(f"{app_path}/Dockerfile")
+        )
+        
+        if not has_app_here:
+            # Try common subdirectories first
+            for subdir_candidate in ("server_setup_agent", "src", "app", "backend", "frontend", "client", "web"):
+                candidate_path = f"{app_path}/{subdir_candidate}"
+                if self._file_exists(f"{candidate_path}/requirements.txt") or self._file_exists(f"{candidate_path}/package.json"):
+                    logger.info(f"  [INSTALL] Auto-detected nested app directory: {candidate_path}")
+                    app_path = candidate_path
+                    ctx.app_path = candidate_path
+                    break
+            else:
+                # If common subdirs didn't work, find first subdirectory with app files
+                try:
+                    code, ls_out, _ = self.executor.execute(f"ls -1d {app_path}/*/ 2>/dev/null | head -20")
+                    if ls_out.strip():
+                        for line in ls_out.strip().split("\n"):
+                            candidate_path = line.rstrip("/").strip()
+                            if candidate_path:
+                                has_app = (
+                                    self._file_exists(f"{candidate_path}/package.json") or
+                                    self._file_exists(f"{candidate_path}/requirements.txt") or
+                                    self._file_exists(f"{candidate_path}/Dockerfile")
+                                )
+                                if has_app:
+                                    logger.info(f"  [INSTALL] Auto-detected nested app directory (via scan): {candidate_path}")
+                                    app_path = candidate_path
+                                    ctx.app_path = candidate_path
+                                    break
+                except Exception as e:
+                    logger.warning(f"  [INSTALL] Could not scan subdirectories: {e}")
+            
+            # If still no app found, show what was in the directory
+            if not (self._file_exists(f"{app_path}/package.json") or self._file_exists(f"{app_path}/requirements.txt")):
+                logger.warning(f"  [INSTALL] No app files found at {app_path}. Contents:")
+                try:
+                    self.executor.execute(f"ls -la {app_path} | head -30")
+                except Exception:
+                    pass
+
         # ── Static (react / vite / angular) ───────────────────────────────
         if stack in ("react", "vite", "angular"):
             self.pkg.install("nodejs")
@@ -750,8 +832,8 @@ class DeploymentAgent:
             self._run(f"npm run build --prefix {app_path}")
 
             if pm == "pm2":
-                # Serve the built dist/ folder using the `serve` static server via pm2
-                self._run("sudo npm install -g serve")
+                # Serve the built dist/ folder using npx serve (no global install needed)
+                # This avoids the sudo terminal issue — npx handles everything
                 self.pm2.install()
                 # Find the actual build output folder
                 dist_path = app_path + "/dist"
@@ -759,11 +841,11 @@ class DeploymentAgent:
                     if self._dir_exists(f"{app_path}/{candidate}"):
                         dist_path = f"{app_path}/{candidate}"
                         break
-                # pm2 start serve -- -s <dist> -l <port>
+                # pm2 start npx -- serve -s <dist> -l <port>
                 self.executor.execute(f"pm2 delete {app_name} 2>/dev/null || true")
                 cmd = (
                     f"cd {app_path} && "
-                    f"pm2 start serve --name {app_name} -- -s {dist_path} -l {port}"
+                    f"pm2 start npx --name {app_name} -- serve -s {dist_path} -l {port}"
                 )
                 code, out, err = self.executor.execute(cmd)
                 if code != 0:
@@ -860,24 +942,52 @@ class DeploymentAgent:
         """Build and run app using Docker."""
         logger.info(f"  [DOCKER] Building {ctx.app_name}")
 
+        app_path = ctx.app_path
+
+        # ── Auto-detect nested app directory ──────────────────────────────
+        # Some repos have structure: repo/ → app_dir/ → Dockerfile
+        if not self._file_exists(f"{app_path}/Dockerfile"):
+            # Try common subdirectories first
+            for subdir_candidate in ("server_setup_agent", "src", "app", "backend", "frontend", "client", "web"):
+                candidate_path = f"{app_path}/{subdir_candidate}"
+                if self._file_exists(f"{candidate_path}/Dockerfile"):
+                    logger.info(f"  [DOCKER] Auto-detected nested app directory: {candidate_path}")
+                    app_path = candidate_path
+                    ctx.app_path = candidate_path
+                    break
+            else:
+                # If common subdirs didn't work, find first subdirectory with Dockerfile
+                try:
+                    code, ls_out, _ = self.executor.execute(f"ls -1d {app_path}/*/ 2>/dev/null | head -20")
+                    if ls_out.strip():
+                        for line in ls_out.strip().split("\n"):
+                            candidate_path = line.rstrip("/").strip()
+                            if candidate_path and self._file_exists(f"{candidate_path}/Dockerfile"):
+                                logger.info(f"  [DOCKER] Auto-detected nested app directory (via scan): {candidate_path}")
+                                app_path = candidate_path
+                                ctx.app_path = candidate_path
+                                break
+                except Exception as e:
+                    logger.warning(f"  [DOCKER] Could not scan subdirectories: {e}")
+
         # Handle case-insensitive Dockerfile names (repo has 'DockerFile' not 'Dockerfile')
         # Normalize to lowercase so docker build works consistently
         self.executor.execute(
-            f"test -f {ctx.app_path}/DockerFile "
-            f"&& mv {ctx.app_path}/DockerFile {ctx.app_path}/Dockerfile 2>/dev/null "
+            f"test -f {app_path}/DockerFile "
+            f"&& mv {app_path}/DockerFile {app_path}/Dockerfile 2>/dev/null "
             f"|| true"
         )
 
         # Auto-generate Dockerfile if still missing but repo has requirements.txt/package.json
-        if not self._file_exists(f"{ctx.app_path}/Dockerfile"):
-            has_requirements = self._file_exists(f"{ctx.app_path}/requirements.txt")
-            has_package_json = self._file_exists(f"{ctx.app_path}/package.json")
+        if not self._file_exists(f"{app_path}/Dockerfile"):
+            has_requirements = self._file_exists(f"{app_path}/requirements.txt")
+            has_package_json = self._file_exists(f"{app_path}/package.json")
             if has_requirements or has_package_json:
                 logger.info(f"  [DOCKER] No Dockerfile found — auto-generating for {ctx.stack}")
                 self._generate_dockerfile(ctx)
             else:
                 raise RuntimeError(
-                    f"No Dockerfile found at {ctx.app_path} and no requirements.txt/package.json "
+                    f"No Dockerfile found at {app_path} and no requirements.txt/package.json "
                     f"to auto-generate one. Please add a Dockerfile to the repo."
                 )
         # Install Docker if needed
@@ -1013,6 +1123,45 @@ class DeploymentAgent:
             ctx.domain = nginx_choice
             self._save_context(ctx)
 
+        # ── Check if sudo_password is available for nginx configuration ────
+        # Nginx requires sudo for installing, configuring, and reloading
+        if self.executor_type == "ssh":
+            executor_config = getattr(self, 'executor_config', {})
+            sudo_password = executor_config.get('sudo_password')
+            
+            # Check if sudo_password was provided in prefill (from user answer)
+            if not sudo_password and self._prefill:
+                sudo_password = self._prefill.get('sudo_password')
+            
+            if not sudo_password:
+                raise NeedsInputError(
+                    f"⚠️ **Sudo Password Required**\n\n"
+                    f"Nginx configuration requires sudo privileges to:\n"
+                    f"- Install nginx (if not already installed)\n"
+                    f"- Write config files to /etc/nginx/\n"
+                    f"- Reload nginx service\n\n"
+                    f"Please provide the sudo password for user `{executor_config.get('username', 'root')}`:",
+                    {
+                        "step": "need_sudo_password",
+                        "ctx_partial": {
+                            "github_url":        ctx.github_url,
+                            "stack":             ctx.stack,
+                            "port":              ctx.port,
+                            "domain":            ctx.domain,
+                            "process_manager":   ctx.process_manager,
+                            "branch":            ctx.branch,
+                            "app_name":          ctx.app_name,
+                            "app_path":          ctx.app_path,
+                            "env_vars":          ctx.env_vars,
+                            "app_type":          ctx.app_type,
+                            "deploy_steps_done": True,
+                            "nginx_choice":      nginx_choice,
+                        },
+                        "prefill": self._prefill or {},
+                        "agent": "deployment",
+                    }
+                )
+
         self.nginx.install()
 
         # ── Ensure SSL certificate exists for domain-based deployments ──────
@@ -1045,15 +1194,36 @@ class DeploymentAgent:
         self.nginx.enable_site(ctx.app_name)
         self.nginx.reload_nginx()
 
+        # ── Configure SSL certificate automatically if domain is provided ────
+        if ctx.domain and ctx.domain != "_" and not self.nginx._is_ip(ctx.domain):
+            logger.info(f"[STEP 4/5] Configuring SSL certificate for {ctx.domain}")
+            try:
+                # Request SSL certificate using Let's Encrypt
+                ssl_result = self._request_ssl_cert(ctx.domain)
+                logger.info(f"[SSL] Certificate result: {ssl_result}")
+            except Exception as e:
+                logger.warning(f"[SSL] Could not configure certificate during deployment: {e}")
+                logger.info(f"[SSL] You can configure SSL later using the ops agent")
+
+
     # ── Public entry point ─────────────────────────────────────────────────────
 
     def execute_task(self, query: str) -> str:
+        # ── Update executor with sudo_password if provided in prefill ────
+        pf = getattr(self, '_prefill', None) or {}
+        if pf.get('sudo_password') and hasattr(self.executor, 'sudo_password'):
+            self.executor.sudo_password = pf['sudo_password']
+            logger.info(f"[DEPLOY] ✓ Sudo password loaded from frontend/prefill")
+        elif hasattr(self.executor, 'sudo_password') and self.executor.sudo_password:
+            logger.info(f"[DEPLOY] ✓ Sudo password loaded from .env")
+        elif self.executor_type == "ssh":
+            logger.warning(f"[DEPLOY] ✗ No sudo password available - nginx configuration may fail")
+        
         # ── Fast-path: resuming after need_nginx question ─────────────────
         # Only skip clone+install if this is a genuine mid-deployment resume:
         # - nginx_choice must be set (user just answered the nginx question)
         # - app_path must be a fully resolved absolute path (no $HOME placeholder)
         # - deploy_steps_done flag must be set (proves clone+install completed this session)
-        pf = getattr(self, '_prefill', None) or {}
         nginx_only = (
             pf.get('nginx_choice') is not None
             and pf.get('app_path')
@@ -1132,6 +1302,21 @@ class DeploymentAgent:
         except Exception as e:
             from app.services.conversation_service import NeedsInputError
             if isinstance(e, NeedsInputError):
+                # Augment the error with full deployment context for proper resumption
+                if not e.state:
+                    e.state = {}
+                if "ctx_partial" not in e.state:
+                    e.state["ctx_partial"] = {
+                        "github_url": ctx.github_url,
+                        "stack": ctx.stack,
+                        "port": ctx.port,
+                        "domain": ctx.domain,
+                        "process_manager": ctx.process_manager,
+                        "branch": ctx.branch,
+                        "app_type": ctx.app_type,
+                        "app_name": ctx.app_name,
+                        "app_path": ctx.app_path,
+                    }
                 raise  # Re-raise to let API handle the prompt
             logger.error(f"[STEP 1 FAILED] {e}")
             self.alerter.critical(
@@ -1162,6 +1347,25 @@ class DeploymentAgent:
             self._step_install(ctx)
             results.append(f"✓ install ({ctx.stack} via {ctx.process_manager})")
         except Exception as e:
+            from app.services.conversation_service import NeedsInputError
+            if isinstance(e, NeedsInputError):
+                # Augment the error with full deployment context for proper resumption
+                if not e.state:
+                    e.state = {}
+                if "ctx_partial" not in e.state:
+                    e.state["ctx_partial"] = {
+                        "github_url": ctx.github_url,
+                        "stack": ctx.stack,
+                        "port": ctx.port,
+                        "domain": ctx.domain,
+                        "process_manager": ctx.process_manager,
+                        "branch": ctx.branch,
+                        "app_type": ctx.app_type,
+                        "app_name": ctx.app_name,
+                        "app_path": ctx.app_path,
+                    }
+                raise
+            
             logger.error(f"[STEP 3 FAILED] {e}")
             err_str = str(e)
             if "no space left" in err_str.lower() or "errno 28" in err_str.lower():
@@ -1188,6 +1392,23 @@ class DeploymentAgent:
         except Exception as e:
             from app.services.conversation_service import NeedsInputError
             if isinstance(e, NeedsInputError):
+                # Augment the error with full deployment context for proper resumption
+                if not e.state:
+                    e.state = {}
+                if "ctx_partial" not in e.state:
+                    e.state["ctx_partial"] = {
+                        "github_url": ctx.github_url,
+                        "stack": ctx.stack,
+                        "port": ctx.port,
+                        "domain": ctx.domain,
+                        "process_manager": ctx.process_manager,
+                        "branch": ctx.branch,
+                        "app_type": ctx.app_type,
+                        "app_name": ctx.app_name,
+                        "app_path": ctx.app_path,
+                        "deploy_steps_done": True,  # clone+install already done
+                        "env_vars": ctx.env_vars,
+                    }
                 raise  # let the API layer catch it and ask the user
             logger.error(f"[STEP 4 FAILED] {e}")
             self.alerter.critical(

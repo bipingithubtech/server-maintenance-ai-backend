@@ -1,0 +1,136 @@
+═══════════════════════════════════════════════════════════════════════════════
+ OPS AGENT PROMPTS — Post-Deployment Nginx & SSL Configuration
+═══════════════════════════════════════════════════════════════════════════════
+
+After your app is deployed, use these prompts with the ops agent to configure
+Nginx and SSL certificate.
+
+───────────────────────────────────────────────────────────────────────────────
+ PROMPT 1: Configure Nginx for Server Maintenance AI
+───────────────────────────────────────────────────────────────────────────────
+
+I just deployed server-maintenance-ai frontend to /home/meetri/ui/server-maintenance-ai/server-ai on port 5173.
+
+Configure Nginx to proxy deploy.meetri.in to this app. The app is a React/Vite frontend.
+
+What the AI will do:
+- Check Nginx installation
+- Generate HTTP-only Nginx config (since SSL not set up yet)
+- Save config to /etc/nginx/sites-available/server-maintenance-ai.conf
+- Enable the site and reload Nginx
+- App becomes accessible at http://deploy.meetri.in
+
+───────────────────────────────────────────────────────────────────────────────
+ PROMPT 2: Configure SSL Certificate
+───────────────────────────────────────────────────────────────────────────────
+
+Set up Let's Encrypt SSL certificate for deploy.meetri.in using admin@meetri.in.
+
+Confirm before running:
+- Domain deploy.meetri.in must be pointing to your server IP
+- Port 80 and 443 must be accessible from the internet
+
+What the AI will do:
+- Request certificate from Let's Encrypt using certbot
+- Install certificate to /etc/letsencrypt/live/deploy.meetri.in/
+- Reload Nginx to use the new certificate
+- App becomes accessible at https://deploy.meetri.in (auto-redirects from HTTP)
+- Certificate auto-renews 30 days before expiration
+
+───────────────────────────────────────────────────────────────────────────────
+ PROMPT 3: Configure Both Nginx & SSL (Complete Setup)
+───────────────────────────────────────────────────────────────────────────────
+
+I deployed server-maintenance-ai frontend to /home/meetri/ui/server-maintenance-ai/server-ai on port 5173.
+- Nginx domain: deploy.meetri.in
+- Email for SSL: admin@meetri.in
+
+Set up complete Nginx + SSL for this domain.
+
+What the AI will do:
+1. Configure Nginx to proxy deploy.meetri.in → localhost:5173
+2. Request SSL certificate from Let's Encrypt
+3. Update Nginx to use HTTPS
+4. Reload Nginx
+5. App is ready at https://deploy.meetri.in
+
+───────────────────────────────────────────────────────────────────────────────
+ PROMPT 4: Configure Nginx for Backend API
+───────────────────────────────────────────────────────────────────────────────
+
+Configure Nginx for luna-backend backend API.
+- App path: /home/meetri/api/luna-backend
+- Port: 3000
+- Domain: api.meetri.in
+- Type: backend
+
+Set up HTTP-only for now (no SSL yet).
+
+What the AI will do:
+- Generate reverse proxy config for api.meetri.in → localhost:3000
+- Save and enable Nginx config
+- App becomes accessible at http://api.meetri.in
+
+───────────────────────────────────────────────────────────────────────────────
+ PROMPT 5: Check Current Nginx Configuration
+───────────────────────────────────────────────────────────────────────────────
+
+Show me the Nginx configuration for server-maintenance-ai. Check if SSL is enabled.
+
+What the AI will do:
+- Read the Nginx config file
+- Check SSL cert status
+- Show current setup
+
+───────────────────────────────────────────────────────────────────────────────
+ PROMPT 6: Troubleshoot SSL Certificate Issue
+───────────────────────────────────────────────────────────────────────────────
+
+SSL certificate for deploy.meetri.in failed. I got "too many failed authorizations".
+
+Help me troubleshoot.
+
+What the AI will do:
+- Check Let's Encrypt logs
+- Verify DNS resolution
+- Check firewall ports 80/443
+- Recommend next steps
+
+───────────────────────────────────────────────────────────────────────────────
+ USING THE OPS AGENT
+───────────────────────────────────────────────────────────────────────────────
+
+1. Go to the chat/ops interface
+2. Click "Operations Agent" (or send message with ops/ops_agent)
+3. Copy one of the prompts above and paste it
+4. The AI will:
+   - Analyze what you want
+   - Use available tools (nginx_setup, configure_ssl)
+   - Execute configuration steps
+   - Report results
+
+Example flow:
+You:  "I deployed server-maintenance-ai to port 5173. Configure Nginx for 
+       deploy.meetri.in"
+
+AI:   [Uses nginx_setup tool]
+      → Installs Nginx
+      → Generates HTTP config
+      → Saves and enables site
+      → Reloads Nginx
+      
+You:  "✓ Deployment successful!"
+
+Then later:
+
+You:  "Set up SSL for deploy.meetri.in with admin@meetri.in"
+
+AI:   [Uses configure_ssl tool]
+      → Requests certificate from Let's Encrypt
+      → Installs certificate
+      → Updates Nginx config
+      → Reloads Nginx
+
+You:  "✓ SSL configured!"
+
+───────────────────────────────────────────────────────────────────────────────
