@@ -97,6 +97,7 @@ Required fields:
 Optional fields (do NOT ask for these — fill automatically or leave empty):
   domain      - domain name or IP for nginx server_name. If not provided, return "".
   env_vars    - object with KEY: "value" pairs if needed (empty object {} if not needed)
+  process_manager - deployment method: pm2 | systemd | docker. Default is pm2 unless user specifies.
 
 Rules:
 - If github_url, stack, AND port are ALL present in the combined message, return JSON immediately.
@@ -105,19 +106,21 @@ Rules:
 - NEVER ask for clarification about nextjs vs nestjs — if user says "next js" use "nextjs".
 - Return ONLY valid JSON. No markdown, no explanation.
 
+SPECIAL: For server-maintenance-ai-backend repo (FastAPI app), use process_manager: "docker" by default.
+
 Examples:
 
 User: "deploy https://github.com/Org/repo.git stack nextjs port 3000"
-Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"3000","domain":"","env_vars":{}}
+Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"3000","domain":"","env_vars":{},"process_manager":"pm2"}
 
 User: "deploy https://github.com/Org/repo.git port 8000 stack next js for frontend"
-Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"8000","domain":"","env_vars":{}}
+Response: {"github_url":"https://github.com/Org/repo.git","stack":"nextjs","port":"8000","domain":"","env_vars":{},"process_manager":"pm2"}
 
-User: "deploy https://github.com/Org/repo.git stack nextjs"
-Response: {"missing":["port"],"question":"What port does the app run on internally? (nginx will proxy port 80 to this)"}
+User: "deploy https://github.com/bipingithubtech/server-maintenance-ai-backend.git stack fastapi port 8000"
+Response: {"github_url":"https://github.com/bipingithubtech/server-maintenance-ai-backend.git","stack":"fastapi","port":"8000","domain":"","env_vars":{},"process_manager":"docker"}
 
 User: "deploy https://github.com/Org/repo.git stack fastapi port 8000 domain myapp.com env DATABASE_URL=postgres://localhost/db"
-Response: {"github_url":"https://github.com/Org/repo.git","stack":"fastapi","port":"8000","domain":"myapp.com","env_vars":{"DATABASE_URL":"postgres://localhost/db"}}
+Response: {"github_url":"https://github.com/Org/repo.git","stack":"fastapi","port":"8000","domain":"myapp.com","env_vars":{"DATABASE_URL":"postgres://localhost/db"},"process_manager":"pm2"}
 """
 
 
@@ -178,6 +181,31 @@ class DeploymentAgent:
         except Exception:
             pass
         return ""
+
+    def _validate_github_token(self, token: str, repo_url: str) -> bool:
+        """
+        Validate GitHub token by attempting a minimal API call.
+        Returns True if token is valid, False otherwise.
+        """
+        import urllib.request as _req, json as _json
+        try:
+            # Try to fetch user info with the token
+            req = _req.Request(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"token {token}",
+                    "User-Agent": "server-setup-agent",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+            )
+            with _req.urlopen(req, timeout=6) as resp:
+                data = _json.loads(resp.read().decode())
+                if "login" in data:
+                    logger.info(f"[DEPLOY] GitHub token validated for user: {data['login']}")
+                    return True
+        except Exception as e:
+            logger.warning(f"[DEPLOY] GitHub token validation failed: {str(e)[:100]}")
+        return False
 
     def _fetch_branches(self, github_url: str) -> list:
         """
@@ -307,6 +335,7 @@ class DeploymentAgent:
                 port       = str(data["port"]),
                 domain     = data.get("domain") or pf.get("domain") or server_host or "_",
                 env_vars   = data.get("env_vars", {}),
+                process_manager = data.get("process_manager", ""),  # Can be pm2, systemd, docker, or empty
             )
             return self._complete_context(ctx, pf, query)
 
@@ -328,15 +357,37 @@ class DeploymentAgent:
             elif ctx.stack in DeploymentContext.BACKEND_STACKS:
                 ctx.app_type = "backend"
 
+        # ── Deployment path ───────────────────────────────────────────
         if pf.get("clone_dir"):
             ctx.app_path = pf["clone_dir"].rstrip("/")
         else:
             ctx._resolve_app_path()
-            logger.info(f"[DEPLOY] Auto-selected clone_dir: {ctx.app_path}")
+            default_path = ctx.app_path
+            logger.info(f"[DEPLOY] Auto-selected clone_dir: {default_path}")
+            
+            # Ask user if they want single app (direct path) or multi-app (subdirectory)
+            raise NeedsInputError(
+                f"How should the app be deployed?\n\n"
+                f"Option 1 (Direct): Clone into single path\n"
+                f"  Path: {default_path}\n"
+                f"  Use when: This is the only app in this directory\n\n"
+                f"Option 2 (Subdirectory): Clone into app-specific subdirectory\n"
+                f"  Path: {default_path}/{ctx.app_name}\n"
+                f"  Use when: Multiple apps share the same directory\n\n"
+                f"Enter choice (1 or 2, or custom path):",
+                {"step": "need_deploy_mode", "ctx_partial": {
+                    "github_url": ctx.github_url, "stack": ctx.stack,
+                    "port": ctx.port, "domain": ctx.domain,
+                    "app_type": ctx.app_type,
+                }, "default_path": default_path, "app_name": ctx.app_name, "prefill": pf, "agent": "deployment"}
+            )
 
         # ── Process manager ────────────────────────────────────────────
         stack = ctx.stack
-        if pf.get("process_manager"):
+        if ctx.process_manager and ctx.process_manager in ("pm2", "systemd", "docker"):
+            # Already set from LLM or prefill — skip prompt
+            logger.info(f"[DEPLOY] Process manager set to: {ctx.process_manager}")
+        elif pf.get("process_manager"):
             ctx.process_manager = pf["process_manager"]
         else:
             raise NeedsInputError(
@@ -399,6 +450,24 @@ class DeploymentAgent:
                     }, "prefill": pf, "agent": "deployment"}
                 )
         else:
+            # Validate the token before using it
+            is_valid = self._validate_github_token(github_token, ctx.github_url)
+            if not is_valid:
+                raise NeedsInputError(
+                    f"The GitHub token appears to be invalid or expired.\n"
+                    f"Error: Authentication failed.\n\n"
+                    f"Please provide a valid GitHub Personal Access Token (PAT) with repo read access:\n"
+                    f"1. Create one at: https://github.com/settings/tokens/new?scopes=repo\n"
+                    f"2. Make sure the token has not expired\n"
+                    f"3. If using an org token, ensure it has access to this repo",
+                    {"step": "need_github_token", "ctx_partial": {
+                        "github_url": ctx.github_url, "stack": ctx.stack,
+                        "port": ctx.port, "domain": ctx.domain,
+                        "process_manager": ctx.process_manager,
+                        "branch": ctx.branch,
+                        "app_type": ctx.app_type,
+                    }, "prefill": pf, "agent": "deployment"}
+                )
             self._github_token = github_token
 
         # ── .env vars ──────────────────────────────────────────────────
@@ -551,18 +620,82 @@ class DeploymentAgent:
             logger.info(f"[CLONE] Repo exists at {ctx.app_path} — pulling latest")
             self._run(f"git -C {ctx.app_path} pull")
         else:
-            logger.info(f"[CLONE] Fresh clone into {ctx.app_path}")
-            self._run(f"sudo rm -rf {ctx.app_path}")
-            # Use sudo for clone so /opt paths work regardless of ownership.
-            # Mask the token from sudo's env by passing it inline in the URL.
-            self._run(
-                f"sudo git clone --config credential.helper='' "
-                f"--branch {ctx.branch} --single-branch "
-                f"{clone_url} {ctx.app_path}"
-            )
-
-        # Fix ownership so subsequent non-sudo commands work on the cloned dir
-        self._run(f"sudo chown -R $(whoami):$(id -gn) {ctx.app_path}")
+            from app.services.conversation_service import NeedsInputError
+            
+            # Check if directory exists but is NOT a git repo
+            dir_exists_code, dir_out, _ = self.executor.execute(f"test -d {ctx.app_path} && echo 'exists' || echo 'missing'")
+            dir_exists = "exists" in dir_out
+            
+            if dir_exists:
+                logger.info(f"[CLONE] Directory exists at {ctx.app_path} but not a git repo — cloning into it")
+            else:
+                logger.info(f"[CLONE] Fresh clone into {ctx.app_path} — directory doesn't exist yet")
+                
+                # Directory doesn't exist, ask for permission to create it
+                delete_confirm = getattr(self, '_delete_confirm', None) or (self._prefill or {}).get('delete_confirm')
+                if delete_confirm is None:
+                    raise NeedsInputError(
+                        f"⚠️ **Fresh deployment detected**\n\n"
+                        f"I need to create and populate the directory:\n"
+                        f"`{ctx.app_path}`\n\n"
+                        f"This will:\n"
+                        f"- Create the directory\n"
+                        f"- Clone the repository\n"
+                        f"- Set up the application\n\n"
+                        f"Type **yes** to proceed, or **no** to cancel.",
+                        {
+                            "step": "confirm_fresh_clone",
+                            "app_path": ctx.app_path,
+                            "app_name": ctx.app_name,
+                            "ctx_partial": {
+                                "github_url": ctx.github_url,
+                                "stack": ctx.stack,
+                                "port": ctx.port,
+                                "domain": ctx.domain,
+                                "process_manager": ctx.process_manager,
+                                "branch": ctx.branch,
+                                "app_name": ctx.app_name,
+                                "app_path": ctx.app_path,
+                                "env_vars": ctx.env_vars,
+                                "app_type": ctx.app_type,
+                            },
+                            "agent": "deployment",
+                        }
+                    )
+                
+                # User confirmed
+                if delete_confirm not in ("yes", "y"):
+                    raise RuntimeError(f"Fresh clone cancelled by user. Directory {ctx.app_path} was NOT created.")
+            
+            # Clone without sudo — user typically owns their app directory
+            # (e.g., /home/meetri/api is owned by meetri user)
+            # Use GIT_ASKPASS=echo to suppress TTY prompt and pass token inline in URL.
+            # This works in headless environments where there's no TTY available.
+            try:
+                self._run(
+                    f"bash -c 'GIT_ASKPASS=echo git clone "
+                    f"--branch {ctx.branch} --single-branch "
+                    f"{clone_url} {ctx.app_path}'"
+                )
+            except RuntimeError as e:
+                error_msg = str(e)
+                if "Authentication failed" in error_msg or "Invalid username or token" in error_msg:
+                    raise RuntimeError(
+                        f"Git clone failed due to authentication error.\n"
+                        f"Details: {error_msg}\n\n"
+                        f"Possible causes:\n"
+                        f"1. GitHub token is invalid or expired\n"
+                        f"2. Token does not have access to this repository\n"
+                        f"3. Repository is private and token is missing\n\n"
+                        f"Solution: Provide a valid GitHub PAT at https://github.com/settings/tokens/new?scopes=repo"
+                    )
+                if "Permission denied" in error_msg or "cannot create" in error_msg.lower():
+                    raise RuntimeError(
+                        f"Permission denied trying to clone to {ctx.app_path}.\n"
+                        f"Details: {error_msg}\n\n"
+                        f"Make sure you own the parent directory or have write permissions."
+                    )
+                raise
         files = self._inspect(f"ls {ctx.app_path}")
         if not files.strip() or "COMMAND DID NOT SUCCEED" in files:
             raise RuntimeError(f"Clone succeeded but {ctx.app_path} is empty.")
@@ -647,7 +780,14 @@ class DeploymentAgent:
             self._run(f"npm install --prefix {app_path}")
             if stack in ("nextjs", "nestjs"):
                 self._run(f"npm run build --prefix {app_path}")
-            entry = "npm" if stack == "nextjs" else ("dist/main.js" if stack == "nestjs" else "index.js")
+            
+            # Determine the startup script
+            # For NestJS and Next.js, use 'npm run start' (respects package.json scripts)
+            # For plain Node.js, use 'npm start' or 'index.js'
+            if stack in ("nextjs", "nestjs"):
+                entry = "npm"  # Will use 'npm run start' in PM2
+            else:
+                entry = "index.js"
 
             if pm == "pm2":
                 self.pm2.install()
@@ -658,8 +798,10 @@ class DeploymentAgent:
             elif pm == "systemd":
                 if stack == "nextjs":
                     exec_start = f"/usr/bin/npm --prefix {app_path} run start"
+                elif stack == "nestjs":
+                    exec_start = f"/usr/bin/npm --prefix {app_path} run start"
                 else:
-                    exec_start = f"/usr/bin/node {app_path}/{entry}"
+                    exec_start = f"/usr/bin/node {app_path}/index.js"
                 self.systemd.create_service_file(
                     service_name=app_name,
                     exec_start=exec_start,
@@ -988,6 +1130,9 @@ class DeploymentAgent:
             self._step_clone(ctx)
             results.append("✓ clone")
         except Exception as e:
+            from app.services.conversation_service import NeedsInputError
+            if isinstance(e, NeedsInputError):
+                raise  # Re-raise to let API handle the prompt
             logger.error(f"[STEP 1 FAILED] {e}")
             self.alerter.critical(
                 title=f"Deployment FAILED: {ctx.app_name} — clone error",

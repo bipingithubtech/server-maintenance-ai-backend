@@ -1,12 +1,12 @@
 {
-  "github_url": "https://github.com/Meetri-IT/pm-frontend.git",
-  "stack": "vite",
-  "port": "4009",
-  "domain": "_",
-  "app_name": "pm-frontend",
-  "app_path": "/opt/ui/pm-frontend",
-  "app_type": "frontend",
-  "env_file_path": "/opt/ui/pm-frontend/.env",
+  "github_url": "https://github.com/bipingithubtech/server-maintenance-ai-backend.git",
+  "stack": "fastapi",
+  "port": "8000",
+  "domain": "31.97.224.45",
+  "app_name": "server-maintenance-ai-backend",
+  "app_path": "/home/meetri/api/server-maintenance-ai-backend",
+  "app_type": "backend",
+  "env_file_path": "/home/meetri/api/server-maintenance-ai-backend/.env",
   "process_manager": "pm2",
-  "branch": "main"
+  "branch": "server/setup"
 }

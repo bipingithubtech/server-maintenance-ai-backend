@@ -141,8 +141,17 @@ class NginxTool:
 
         app_path must be a Linux path string (e.g. '/opt/myapp/dist').
         port accepts int or string — will be coerced to int automatically.
+        
+        IMPORTANT: When domain is empty or "_", it's replaced with app_name for proper
+        SSL cert paths. This ensures SSL certificates use the app name, not the generic "_".
         """
         framework_lower = framework.lower()
+        
+        # If domain is empty or "_", use app_name instead for SSL cert paths
+        # This prevents SSL cert lookup failures
+        if not domain or domain.strip() in ("_", "", "none", "null"):
+            domain = app_name
+        
         is_ip = self._is_ip(domain)
 
         # Coerce port to int if the LLM passes it as a string

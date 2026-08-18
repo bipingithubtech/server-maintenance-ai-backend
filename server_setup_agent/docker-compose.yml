@@ -1,0 +1,151 @@
+version: '3.8'
+
+# ════════════════════════════════════════════════════════════════
+# Load environment variables from .env file
+# Docker Compose automatically loads .env in the same directory
+# Override specific vars: docker-compose --env-file .env.production up -d
+# ════════════════════════════════════════════════════════════════
+
+services:
+  # ════════════════════════════════════════════════════════════════
+  # PostgreSQL Database
+  # ════════════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:15-alpine
+    container_name: smai-postgres
+    environment:
+      POSTGRES_USER: smai_user
+      POSTGRES_PASSWORD: smai_secure_password_2024
+      POSTGRES_DB: server_maintenance_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smai_user -d server_maintenance_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - smai_network
+    restart: unless-stopped
+
+  # ════════════════════════════════════════════════════════════════
+  # Qdrant Vector Database (for embeddings/RAG)
+  # ════════════════════════════════════════════════════════════════
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: smai-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT_API_KEY: qdrant_api_key_2024
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - smai_network
+    restart: unless-stopped
+
+  # ════════════════════════════════════════════════════════════════
+  # FastAPI Application
+  # ════════════════════════════════════════════════════════════════
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smai-app
+    env_file:
+      - .env
+    environment:
+      # FastAPI/Uvicorn
+      PYTHONUNBUFFERED: "1"
+      
+      # LLM Configuration (from .env)
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      MODEL_NAME: ${MODEL_NAME}
+      TEMPERATURE: ${TEMPERATURE:-0.0}
+      
+      # GitHub (from .env)
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      
+      # Database (internal — app talks to postgres service)
+      DATABASE_URL: postgresql://smai_user:smai_secure_password_2024@postgres:5432/server_maintenance_db
+      
+      # Vector Database (internal — app talks to qdrant service)
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: qdrant_api_key_2024
+      
+      # SSH Configuration (from .env)
+      SSH_HOST: ${SSH_HOST}
+      SSH_PORT: ${SSH_PORT:-22}
+      SSH_USERNAME: ${SSH_USERNAME}
+      SSH_KEY_PATH: ${SSH_KEY_PATH}
+      
+      # Teams Webhook (from .env)
+      TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL}
+    
+    ports:
+      - "8000:8000"
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    
+    volumes:
+      # Mount config and log directories
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+      - ${SSH_KEY_PATH}:/app/.ssh/id_ed25519:ro
+    
+    networks:
+      - smai_network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ════════════════════════════════════════════════════════════════
+  # Nginx Reverse Proxy (Optional)
+  # ════════════════════════════════════════════════════════════════
+  nginx:
+    image: nginx:alpine
+    container_name: smai-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - app
+    networks:
+      - smai_network
+    restart: unless-stopped
+
+# ════════════════════════════════════════════════════════════════
+# Volumes
+# ════════════════════════════════════════════════════════════════
+volumes:
+  postgres_data:
+    driver: local
+  qdrant_data:
+    driver: local
+
+# ════════════════════════════════════════════════════════════════
+# Networks
+# ════════════════════════════════════════════════════════════════
+networks:
+  smai_network:
+    driver: bridge

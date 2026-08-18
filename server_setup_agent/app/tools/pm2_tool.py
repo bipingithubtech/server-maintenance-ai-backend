@@ -31,16 +31,28 @@ class PM2Tool:
     ) -> str:
         """
         Starts an app with PM2.
-        For Next.js apps, use script='npm' and the args 'run start' will be added automatically.
+        For Next.js/NestJS apps, use script='npm' and will auto-detect start script.
+        Detects 'start:prod' first (production), then 'start' (default).
         If port is provided, it is injected via the PORT env var so Next.js / Node honours it.
         """
         port_env = f"PORT={port} " if port else ""
 
-        # For Next.js: pm2 start npm --name app -- run start
+        # For Next.js/NestJS: pm2 start npm --name app -- run start (or start:prod)
         if script in ("npm", "yarn") or script.endswith("npm"):
+            # Auto-detect if start:prod exists in package.json
+            start_script = "start"
+            pkg_json_path = f"{working_directory}/package.json"
+            
+            # Check if start:prod script exists
+            check_cmd = f"grep -q '\"start:prod\"' {pkg_json_path} 2>/dev/null && echo 'exists' || echo 'not found'"
+            _, check_out, _ = self.executor.execute(check_cmd)
+            if "exists" in check_out:
+                start_script = "start:prod"
+                logger.info(f"[PM2] Detected start:prod script for {app_name}")
+            
             cmd = (
                 f"cd {working_directory} && "
-                f"{port_env}pm2 start npm --name {app_name} -- run start"
+                f"{port_env}pm2 start npm --name {app_name} -- run {start_script}"
             )
         else:
             cmd = (

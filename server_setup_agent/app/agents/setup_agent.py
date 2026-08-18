@@ -120,6 +120,11 @@ Rules:
 - NEVER include infra service names (redis, postgres, mysql, mongodb) in tasks — they only belong in infra_services
 - Return ONLY valid JSON
 
+Special handling for clarification responses:
+- If user just says "yes", "y", "ok", "proceed", "start", "go", "confirm", "sure" after the question:
+  treat as: "I'm ready to proceed but haven't told you what to setup — ask again what they want"
+- If user says "full setup" or "everything": include all tasks (base, nginx, docker, nodejs, pm2, python, firewall, fail2ban, ssh_harden, auto_updates) + common infra (redis, postgres)
+
 Examples:
 
 User: "setup a fresh server as root, create a sudo user called deploy, then harden it"
@@ -133,6 +138,12 @@ Response: {"tasks":["base","nginx","nodejs","pm2","docker","firewall","fail2ban"
 
 User: "setup server with postgres and redis for python backend"
 Response: {"tasks":["base","python","docker","firewall"],"infra_services":["redis","postgres"],"extra_packages":[],"extra_commands":[],"firewall_ports":[],"server_purpose":"Python backend with Redis and Postgres","new_username":""}
+
+User: "full setup"
+Response: {"tasks":["base","nginx","docker","nodejs","pm2","python","firewall","fail2ban","ssh_harden","auto_updates"],"infra_services":["redis","postgres"],"extra_packages":[],"extra_commands":[],"firewall_ports":[],"server_purpose":"Complete server setup with all common services","new_username":""}
+
+User: "yes", "ok", "proceed", "start"
+Response: {"missing":true,"question":"What would you like to set up? E.g. web server (nginx), Node.js app, Python app, Docker, Redis, Postgres, full setup, fresh server bootstrap, etc."}
 
 User: "missing something"
 Response: {"missing":true,"question":"What would you like to set up? E.g. web server (nginx), Node.js app, Python app, Docker, Redis, Postgres, full setup, fresh server bootstrap, etc."}

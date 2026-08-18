@@ -1,12 +1,13 @@
 {
   "tasks": [
-    "firewall"
+    "base",
+    "docker"
   ],
   "infra_services": [],
   "extra_packages": [],
   "extra_commands": [],
   "firewall_ports": [],
-  "server_purpose": "firewall configuration",
+  "server_purpose": "Docker installation",
   "new_username": "",
   "your_public_key": ""
 }

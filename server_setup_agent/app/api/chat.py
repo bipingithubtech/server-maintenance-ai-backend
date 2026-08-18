@@ -297,6 +297,46 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "need_deploy_mode":
+        answer = user_answer.strip().lower()
+        default_path = agent_state.get("default_path", "")
+        app_name = agent_state.get("app_name", "")
+        
+        if answer == "1" or answer == "direct" or not answer:
+            # User chose direct path (option 1)
+            prefill["clone_dir"] = default_path
+        elif answer == "2" or answer == "subdirectory" or answer == "sub":
+            # User chose subdirectory path (option 2)
+            prefill["clone_dir"] = f"{default_path}/{app_name}".rstrip("/")
+        elif answer.startswith("/"):
+            # User provided custom path - check if it ends with app name
+            custom_path = answer.rstrip("/")
+            # If path doesn't end with app_name, append it (for multi-app scenarios)
+            if not custom_path.endswith(app_name):
+                prefill["clone_dir"] = f"{custom_path}/{app_name}".rstrip("/")
+            else:
+                prefill["clone_dir"] = custom_path
+        else:
+            # Treat as custom subdirectory name
+            prefill["clone_dir"] = f"{default_path}/{answer}".rstrip("/")
+        
+        # Merge ctx_partial so all core fields survive the resume
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
+    elif step == "need_deploy_path":
+        answer = user_answer.strip()
+        default_path = agent_state.get("default_path", "")
+        if not answer or answer.lower() in ("default", "skip", ""):
+            # User accepted default path
+            prefill["clone_dir"] = default_path
+        else:
+            # User provided custom path
+            prefill["clone_dir"] = answer
+        # Merge ctx_partial so all core fields survive the resume
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
     elif step == "need_process_manager":
         default_pm = agent_state.get("default_pm", "pm2")
         pm = user_answer.strip().lower()
@@ -397,6 +437,16 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "confirm_fresh_clone":
+        answer = user_answer.strip().lower()
+        if answer in ("yes", "y"):
+            prefill["delete_confirm"] = "yes"
+        else:
+            prefill["delete_confirm"] = "no"
+        # Merge ctx_partial so deployment can resume
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
     elif step == "cleanup_confirm":
         import json as _json
         answer = user_answer.strip().lower()
@@ -447,6 +497,8 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
                 agent._github_token = prefill["github_token"]
             if prefill.get("nginx_choice") is not None:
                 agent._nginx_choice = prefill["nginx_choice"]
+            if prefill.get("delete_confirm") is not None:
+                agent._delete_confirm = prefill["delete_confirm"]
             result = agent.execute_task(new_query)
 
         elif agent_name == "maintenance":

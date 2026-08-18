@@ -23,6 +23,7 @@ from app.executors.executor_factory import ExecutorFactory
 from app.tools.linux_tool import LinuxTool
 from app.tools.security_tool import SecurityTool
 from app.tools.firewall_tool import FirewallTool
+from app.tools.nginx_tool import NginxTool
 
 
 TOOLS = [
@@ -135,6 +136,62 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "pm2_start",
+            "description": "Start or restart an app with PM2. Automatically detects start:prod or start script from package.json.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string", "description": "App name/path (e.g., 'luna-backend' or '/home/meetri/api/luna-backend')"},
+                    "port": {"type": "string", "description": "Port number (optional, e.g., '3000')"},
+                },
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pm2_status",
+            "description": "Show all PM2 processes and their status.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pm2_logs",
+            "description": "Show logs for a specific PM2 app.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string", "description": "App name (e.g., 'luna-backend')"},
+                    "lines": {"type": "integer", "description": "Number of lines to show (default: 50)"},
+                },
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "nginx_setup",
+            "description": "Configure Nginx for an app anytime (even after deployment). Can be used to add or reconfigure Nginx for apps that skipped it during deployment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string", "description": "App name (e.g., 'luna-backend')"},
+                    "app_path": {"type": "string", "description": "Full app path (e.g., '/home/meetri/api/luna-backend')"},
+                    "port": {"type": "string", "description": "Internal port the app listens on (e.g., '3000')"},
+                    "domain": {"type": "string", "description": "Domain or IP for Nginx (e.g., 'pm.meetri.in' or '192.168.1.1')"},
+                    "app_type": {"type": "string", "enum": ["frontend", "backend"], "description": "App type: frontend (static files) or backend (process)"},
+                },
+                "required": ["app_name", "app_path", "port", "domain", "app_type"],
+            },
+        },
+    },
 ]
 
 # Commands that must get explicit user confirmation before execution
@@ -165,6 +222,7 @@ class OpsAgent:
         self.linux = LinuxTool(self.executor)
         self.security = SecurityTool(self.executor)
         self.firewall = FirewallTool(self.executor)
+        self.nginx = NginxTool(self.executor)
         self.alerter = TeamsAlerter()
         self.server_label = server_label or "unknown"
         self.require_confirmation = require_confirmation
@@ -321,10 +379,11 @@ class OpsAgent:
                     details="⚠️ UFW firewall has been completely reset. ALL custom rules have been deleted.",
                 )
                 return result
-            
-            if self.require_confirmation:
+
+            if self._is_dangerous("ufw reset") and self.require_confirmation:
                 raise NeedsInputError(
-                    "⚠️  Resetting firewall will delete ALL custom rules. Type **yes** to confirm or **no** to skip.",
+                    "⚠️  DESTRUCTIVE: This will reset the firewall to factory defaults and remove ALL custom rules.\n"
+                    "Type **yes** to confirm.",
                     {
                         "step": "ops_confirm_command",
                         "pending_command": "firewall_reset",
@@ -332,6 +391,109 @@ class OpsAgent:
                     },
                 )
             return self.firewall.reset_firewall()
+        
+        # ── PM2 Operations ─────────────────────────────────────────────────
+        if name == "pm2_start":
+            app_path = args["app_name"]
+            port = args.get("port", "")
+            
+            # Resolve app path if it's just a name
+            if not app_path.startswith("/"):
+                app_path = f"/home/meetri/api/{app_path}"
+            
+            app_name = app_path.rstrip("/").split("/")[-1]
+            
+            # Delete any existing PM2 instances to prevent duplicates
+            logger.info(f"[OPS] PM2 START: Cleaning up old instances of {app_name}")
+            self._exec(f"pm2 delete {app_name} 2>/dev/null || true")
+            
+            # Auto-detect start script
+            pkg_json = f"{app_path}/package.json"
+            check_cmd = f"grep -q '\"start:prod\"' {pkg_json} 2>/dev/null && echo 'prod' || echo 'start'"
+            _, script_type, _ = self.executor.execute(check_cmd)
+            start_script = "start:prod" if "prod" in script_type else "start"
+            
+            # Build PM2 command
+            port_env = f"PORT={port} " if port else ""
+            cmd = f"cd {app_path} && {port_env}pm2 start npm --name {app_name} -- run {start_script}"
+            
+            logger.info(f"[OPS] PM2 START: {app_path} (using {start_script})")
+            result = self._run_command(cmd)
+            
+            # Verify it started
+            _, pm2_list, _ = self.executor.execute("pm2 list --no-color")
+            return result + f"\n✅ App started as PM2 process '{app_name}'"
+        
+        if name == "pm2_status":
+            logger.info("[OPS] PM2 STATUS")
+            return self._exec("pm2 list --no-color")
+        
+        if name == "pm2_logs":
+            app_name = args["app_name"]
+            lines = args.get("lines", 50)
+            logger.info(f"[OPS] PM2 LOGS: {app_name}")
+            
+            # Use timeout to prevent hanging on large logs
+            # If pm2 logs takes more than 10 seconds, kill it
+            cmd = f"timeout 10 pm2 logs {app_name} --lines {lines} --nostream --no-color || true"
+            result = self._exec(cmd)
+            
+            if not result or result.strip() == "":
+                return f"⚠️ No logs for {app_name} (or command timed out after 10 seconds)"
+            return result
+        
+        if name == "nginx_setup":
+            app_name = args["app_name"]
+            app_path = args["app_path"]
+            port = args.get("port", "3000")
+            domain = args["domain"]
+            app_type = args.get("app_type", "backend")
+            
+            logger.info(f"[OPS] NGINX SETUP: {app_name} (domain={domain}, port={port}, type={app_type})")
+            
+            try:
+                self.nginx.install()
+                
+                # Ensure SSL if domain (not IP)
+                if domain and not NginxTool._is_ip(domain):
+                    ssl_status = self.nginx.ensure_ssl_cert(domain)
+                    logger.info(f"[NGINX] SSL cert status: {ssl_status}")
+                
+                # Generate config based on app type
+                if app_type == "frontend":
+                    # Find dist folder
+                    dist_path = f"{app_path}/dist"
+                    for candidate in (".next", "dist", "build", "out"):
+                        candidate_path = f"{app_path}/{candidate}"
+                        result = self._exec(f"test -d {candidate_path} && echo 'exists' || echo 'not'")
+                        if "exists" in result:
+                            dist_path = candidate_path
+                            break
+                    self.nginx.generate_and_save_config(
+                        framework="react",
+                        domain=domain,
+                        app_name=app_name,
+                        app_path=dist_path,
+                    )
+                else:
+                    # Backend app
+                    self.nginx.generate_and_save_config(
+                        framework="nodejs",
+                        domain=domain,
+                        app_name=app_name,
+                        port=int(port),
+                    )
+                
+                self.nginx.test_config()
+                self.nginx.enable_site(app_name)
+                self.nginx.reload_nginx()
+                
+                logger.info(f"[OPS] NGINX SETUP COMPLETE: {app_name}")
+                return f"✅ Nginx configured for {app_name}\nDomain: {domain}\nPort: {port}\nConfig: /etc/nginx/sites-available/{app_name}.conf"
+            except Exception as e:
+                logger.error(f"[OPS] NGINX SETUP FAILED: {e}")
+                return f"❌ Nginx setup failed: {e}"
+        
         return f"Unknown tool: {name}"
 
     @staticmethod
