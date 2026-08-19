@@ -501,11 +501,13 @@ class OpsAgent:
                     )
                 
                 self.nginx.test_config()
-                self.nginx.enable_site(app_name)
+                self.nginx.enable_site(app_name, domain)
                 self.nginx.reload_nginx()
                 
+                # Determine config name for status message
+                config_name = domain if (domain and not self.nginx._is_ip(domain) and domain.strip() not in ("_", "", "none", "null")) else app_name
                 logger.info(f"[OPS] NGINX SETUP COMPLETE: {app_name}")
-                return f"✅ Nginx configured for {app_name}\nDomain: {domain}\nPort: {port}\nConfig: /etc/nginx/sites-available/{app_name}.conf"
+                return f"✅ Nginx configured for {app_name}\nDomain: {domain}\nPort: {port}\nConfig: /etc/nginx/sites-available/{config_name}"
             except Exception as e:
                 logger.error(f"[OPS] NGINX SETUP FAILED: {e}")
                 return f"❌ Nginx setup failed: {e}"
@@ -528,30 +530,26 @@ class OpsAgent:
                     return f"✅ Certificate check complete for {domain}.\n{renewal_result}"
                 
                 # Install certbot if not present
-                install_result = self._exec("which certbot || sudo apt-get install -y certbot python3-certbot-nginx")
+                install_result = self._exec("which certbot || sudo apt-get update && sudo apt-get install -y certbot python3-certbot-nginx")
                 
-                # Configure SSL via certbot using standalone mode (no nginx plugin issues)
+                # Configure SSL via certbot using nginx plugin (works with nginx running)
                 logger.info(f"[SSL] Requesting Let's Encrypt certificate for {domain}...")
                 certbot_cmd = (
-                    f"sudo certbot certonly --standalone --non-interactive --agree-tos "
-                    f"--email {email} "
-                    f"-d {domain} 2>&1"
+                    f"sudo certbot --nginx -d {domain} --non-interactive --agree-tos "
+                    f"--email {email} --redirect 2>&1"
                 )
                 result = self._run_command(certbot_cmd)
                 
                 # Check if successful
-                if "Successfully received certificate" in result or "Certificate not yet due for renewal" in result:
+                if "Successfully received certificate" in result or "Certificate not yet due for renewal" in result or "Congratulations" in result:
                     logger.info(f"[SSL] Certificate configured successfully for {domain}")
-                    logger.info(f"[SSL] Reloading Nginx to use new certificate...")
-                    
-                    # Reload Nginx to use the certificate
-                    reload_result = self._run_command("sudo systemctl reload nginx")
                     
                     return (
                         f"✅ SSL certificate successfully obtained for {domain}\n"
                         f"- Cert path: {cert_dir}/fullchain.pem\n"
                         f"- Key path: {cert_dir}/privkey.pem\n"
-                        f"- Auto-renewal: Enabled\n\n"
+                        f"- Auto-renewal: Enabled\n"
+                        f"- HTTPS redirect: Configured\n\n"
                         f"Your app is now accessible at https://{domain}"
                     )
                 else:
@@ -567,7 +565,7 @@ class OpsAgent:
             
             except Exception as e:
                 logger.error(f"[SSL] Configuration failed: {e}")
-                return f"❌ SSL configuration failed: {e}\n\nFor debugging, run on server: sudo certbot certonly --standalone -d {domain}"
+                return f"❌ SSL configuration failed: {e}\n\nFor debugging, run on server: sudo certbot --nginx -d {domain}"
         
         return f"Unknown tool: {name}"
 

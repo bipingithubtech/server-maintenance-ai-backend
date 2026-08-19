@@ -549,7 +549,7 @@ class DeploymentAgent:
         logger.info("[CONTEXT] Saved to deployment_context.json (env_vars stored in server .env only)")
 
     def _request_ssl_cert(self, domain: str) -> str:
-        """Request SSL certificate from Let's Encrypt using certbot (standalone mode)."""
+        """Request SSL certificate from Let's Encrypt using certbot (nginx plugin)."""
         import os
         
         # Get default email from environment or use a placeholder
@@ -557,24 +557,22 @@ class DeploymentAgent:
         
         logger.info(f"[SSL] Requesting certificate for {domain} using email {email}")
         
-        # Install certbot if not present
-        self._run(f"which certbot || sudo apt-get install -y certbot")
+        # Install certbot and nginx plugin if not present
+        self._run(f"which certbot || sudo apt-get update && sudo apt-get install -y certbot python3-certbot-nginx")
         
-        # Request certificate in standalone mode (no nginx plugin issues)
+        # Request certificate using nginx plugin (works with nginx running)
+        # This method automatically updates nginx config with SSL settings
         cert_cmd = (
-            f"sudo certbot certonly --standalone --non-interactive "
-            f"--agree-tos --email {email} "
-            f"-d {domain} 2>&1"
+            f"sudo certbot --nginx -d {domain} --non-interactive "
+            f"--agree-tos --email {email} --redirect 2>&1"
         )
         
         code, out, err = self.executor.execute(cert_cmd)
         result = out or err
         
-        if code == 0 or "Successfully received certificate" in result or "not yet due for renewal" in result:
-            logger.info(f"[SSL] Certificate obtained for {domain}")
-            # Reload nginx to use the cert (if nginx_setup was already called)
-            self._run("sudo systemctl reload nginx 2>/dev/null || true")
-            return f"✅ SSL certificate configured for {domain}"
+        if code == 0 or "Successfully received certificate" in result or "not yet due for renewal" in result or "Certificate not yet due for renewal" in result:
+            logger.info(f"[SSL] Certificate obtained and nginx configured for {domain}")
+            return f"✅ SSL certificate configured for {domain} with HTTPS redirect"
         else:
             # Non-critical: SSL failure during deployment should not block
             logger.warning(f"[SSL] Certificate request failed (non-critical): {result}")
@@ -1169,29 +1167,19 @@ class DeploymentAgent:
             ssl_status = self.nginx.ensure_ssl_cert(ctx.domain)
             logger.info(f"SSL cert status: {ssl_status}")
 
-        if ctx.stack in ("react", "vite", "angular"):
-            # Find the static dist folder
-            dist_path = ctx.app_path + "/dist"
-            for candidate in (".next", "dist", "build", "out"):
-                if self._dir_exists(f"{ctx.app_path}/{candidate}"):
-                    dist_path = f"{ctx.app_path}/{candidate}"
-                    break
-            self.nginx.generate_and_save_config(
-                framework=ctx.stack,
-                domain=ctx.domain,
-                app_name=ctx.app_name,
-                app_path=dist_path,
-            )
-        else:
-            self.nginx.generate_and_save_config(
-                framework=ctx.stack,
-                domain=ctx.domain,
-                app_name=ctx.app_name,
-                port=int(ctx.port),
-            )
+        # ── Always use reverse proxy (consistent for all stacks) ────────────
+        # Frontend (React/Vite/Angular) runs on port via `serve` or dev server
+        # Backend (Flask/FastAPI/Express) runs on port directly
+        # Nginx proxies to the port for all stacks
+        self.nginx.generate_and_save_config(
+            framework=ctx.stack,
+            domain=ctx.domain,
+            app_name=ctx.app_name,
+            port=int(ctx.port),
+        )
 
         self.nginx.test_config()
-        self.nginx.enable_site(ctx.app_name)
+        self.nginx.enable_site(ctx.app_name, ctx.domain)
         self.nginx.reload_nginx()
 
         # ── Configure SSL certificate automatically if domain is provided ────

@@ -8,13 +8,18 @@ map $http_upgrade $connection_upgrade {
     ''      close;
 }
 
-# HTTP-only — IP address deployment (no domain, no TLS possible)
+# HTTP-only — Will be upgraded to HTTPS by certbot
 server {
     listen 80;
     listen [::]:80;
     server_name {{ domain }};
 
     client_max_body_size 25M;
+
+    # ── Allow certbot ACME challenges for SSL certificate verification ──────
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
 
     # ── Hide Nginx version from headers/error pages ─────────────────────────
     server_tokens off;

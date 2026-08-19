@@ -4,9 +4,9 @@
   "port": "5173",
   "domain": "deploy.meetri.in",
   "app_name": "server-maintenance-ai",
-  "app_path": "/home/meetri/ui/server-maintenance-ai/server-ai",
+  "app_path": "/home/meetri/api/server-maintenance-ai/server-ai",
   "app_type": "frontend",
-  "env_file_path": "/home/meetri/ui/server-maintenance-ai/server-ai/.env",
+  "env_file_path": "/home/meetri/api/server-maintenance-ai/server-ai/.env",
   "process_manager": "pm2",
   "branch": "main"
 }

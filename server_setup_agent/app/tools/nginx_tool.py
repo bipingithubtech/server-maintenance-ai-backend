@@ -17,8 +17,8 @@ class NginxTool:
     produce broken paths when commands are sent to a Linux server over SSH.
     """
 
-    STATIC_FRAMEWORKS = {"react", "vite", "angular", "static"}
-    PROXY_FRAMEWORKS  = {"fastapi", "nextjs", "nodejs", "nestjs", "flask", "django", "ai"}
+    STATIC_FRAMEWORKS = {"static"}  # Only pure static HTML sites
+    PROXY_FRAMEWORKS  = {"react", "vite", "angular", "fastapi", "nextjs", "nodejs", "nestjs", "flask", "django", "ai"}
 
     # SSL cert paths used across all HTTPS configs
     SSL_CERT = "/etc/nginx/ssl/sslcert.crt"
@@ -173,7 +173,10 @@ class NginxTool:
         
         is_ip = self._is_ip(domain)
         
-        # Check if SSL cert actually exists for this domain
+        # For domain-based deployments:
+        # - Generate HTTP-only config initially (with ACME challenge support)
+        # - Certbot nginx plugin will upgrade it to HTTPS later
+        # Only use HTTPS template if cert already exists
         has_cert = False
         if not is_ip:
             cert_dir = f"/etc/letsencrypt/live/{domain}"
@@ -254,16 +257,30 @@ class NginxTool:
             app_path=app_path,
             port=port,
         )
-        self.save_config(app_name, config_content)
-        return f"Nginx config generated and saved to /etc/nginx/sites-available/{app_name}.conf"
+        self.save_config(app_name, config_content, domain)
+        
+        # Determine config name for status message
+        config_name = domain if (domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null")) else app_name
+        return f"Nginx config generated and saved to /etc/nginx/sites-available/{config_name}"
 
-    def save_config(self, app_name: str, config_content: str) -> str:
-        """Saves the config to /etc/nginx/sites-available/<app_name>.conf via base64 encoding."""
+    def save_config(self, app_name: str, config_content: str, domain: Optional[str] = None) -> str:
+        """
+        Saves the config to /etc/nginx/sites-available/ via base64 encoding.
+        
+        If domain is provided, uses {domain} naming (NO .conf extension in the name).
+        Otherwise falls back to {app_name} for backwards compatibility.
+        """
+        # Use domain-based naming if domain is provided and valid
+        if domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null"):
+            config_name = domain  # e.g., "deploy.meetri.in"
+        else:
+            config_name = app_name
+        
         # Plain string — no pathlib, no Windows backslashes
-        target_path = f"/etc/nginx/sites-available/{app_name}.conf"
+        target_path = f"/etc/nginx/sites-available/{config_name}"
 
         # Write to temp file first (no sudo needed)
-        temp_path = f"/tmp/{app_name}.conf.tmp"
+        temp_path = f"/tmp/{config_name}.tmp"
         encoded_content = base64.b64encode(config_content.encode("utf-8")).decode("utf-8")
         
         # Write to temp location (no sudo needed)
@@ -284,10 +301,19 @@ class NginxTool:
         logger.info(f"Successfully saved Nginx config to {target_path}")
         return "Config saved successfully."
 
-    def enable_site(self, app_name: str) -> str:
-        """Enables the site by symlinking into sites-enabled."""
-        available_path = f"/etc/nginx/sites-available/{app_name}.conf"
-        enabled_path   = f"/etc/nginx/sites-enabled/{app_name}.conf"
+    def enable_site(self, app_name: str, domain: Optional[str] = None) -> str:
+        """
+        Enables the site by symlinking into sites-enabled.
+        Uses domain name if provided, otherwise app_name.
+        """
+        # Use domain-based naming if domain is provided and valid
+        if domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null"):
+            config_name = domain
+        else:
+            config_name = app_name
+        
+        available_path = f"/etc/nginx/sites-available/{config_name}"
+        enabled_path   = f"/etc/nginx/sites-enabled/{config_name}"
 
         # First check if already enabled
         check_code, _, _ = self.executor.execute(f"test -L {enabled_path}")
@@ -303,20 +329,29 @@ class NginxTool:
             logger.error(f"Failed to enable site {app_name}: {err}")
             raise RuntimeError(f"Failed to enable site:\n{err}")
 
-        logger.info(f"Successfully enabled site {app_name}")
-        return f"Site {app_name} enabled."
+        logger.info(f"Successfully enabled site {config_name}")
+        return f"Site {config_name} enabled."
 
-    def disable_site(self, app_name: str) -> str:
-        """Disables the site by removing its symlink from sites-enabled."""
-        enabled_path = f"/etc/nginx/sites-enabled/{app_name}.conf"
+    def disable_site(self, app_name: str, domain: Optional[str] = None) -> str:
+        """
+        Disables the site by removing its symlink from sites-enabled.
+        Uses domain name if provided, otherwise app_name.
+        """
+        # Use domain-based naming if domain is provided and valid
+        if domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null"):
+            config_name = domain
+        else:
+            config_name = app_name
+        
+        enabled_path = f"/etc/nginx/sites-enabled/{config_name}"
 
         exit_code, out, err = self.executor.execute(f"sudo rm -f {enabled_path}")
         if exit_code != 0:
             logger.error(f"Failed to disable site {app_name}: {err}")
             raise RuntimeError(f"Failed to disable site:\n{err}")
 
-        logger.info(f"Successfully disabled site {app_name}")
-        return f"Site {app_name} disabled."
+        logger.info(f"Successfully disabled site {config_name}")
+        return f"Site {config_name} disabled."
 
     def test_config(self) -> str:
         """Tests the Nginx configuration for syntax errors."""
@@ -351,8 +386,14 @@ class NginxTool:
         Updates an existing Nginx config to use HTTPS/SSL after a certificate is obtained.
         This is called from ops_agent after certbot completes.
         """
+        # Use domain-based naming if domain is provided and valid
+        if domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null"):
+            config_name = domain
+        else:
+            config_name = app_name
+        
         # Read existing config
-        available_path = f"/etc/nginx/sites-available/{app_name}.conf"
+        available_path = f"/etc/nginx/sites-available/{config_name}"
         
         try:
             code, config_content, err = self.executor.execute(f"cat {available_path}")
@@ -400,23 +441,35 @@ server {{
         updated_config = http_redirect + updated_config
         
         # Save updated config
-        self.save_config(app_name, updated_config)
+        self.save_config(app_name, updated_config, domain)
         
         # Test and reload
         self.test_config()
         self.reload_nginx()
         
-        logger.info(f"Updated {app_name} config with SSL certificates")
+        logger.info(f"Updated {config_name} config with SSL certificates")
         return f"✅ Config updated with SSL certificates for {domain}"
-        """Removes the site config from both available and enabled."""
-        self.disable_site(app_name)
-        available_path = f"/etc/nginx/sites-available/{app_name}.conf"
+    
+    def delete_site(self, app_name: str, domain: Optional[str] = None) -> str:
+        """
+        Removes the site config from both available and enabled.
+        Uses domain name if provided, otherwise app_name.
+        """
+        self.disable_site(app_name, domain)
+        
+        # Use domain-based naming if domain is provided and valid
+        if domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null"):
+            config_name = domain
+        else:
+            config_name = app_name
+        
+        available_path = f"/etc/nginx/sites-available/{config_name}"
         exit_code, out, err = self.executor.execute(f"sudo rm -f {available_path}")
         if exit_code != 0:
-            logger.error(f"Failed to delete available config for {app_name}: {err}")
+            logger.error(f"Failed to delete available config for {config_name}: {err}")
             raise RuntimeError(f"Failed to delete site config:\n{err}")
-        logger.info(f"Successfully deleted site {app_name} configs.")
-        return f"Site {app_name} deleted."
+        logger.info(f"Successfully deleted site {config_name} configs.")
+        return f"Site {config_name} deleted."
 
     def ensure_ws_map(self) -> str:
         """
