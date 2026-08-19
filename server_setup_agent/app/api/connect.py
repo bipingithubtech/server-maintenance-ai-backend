@@ -30,6 +30,13 @@ class ConnectResponse(BaseModel):
     user:      Optional[str] = None
     host:      Optional[str] = None
     error:     Optional[str] = None
+    public_keys: Optional[dict] = None  # NEW: Map of key paths to public key content
+
+
+class PublicKeysResponse(BaseModel):
+    """Response containing discovered public keys from the system"""
+    public_keys: dict  # Map of private key path -> public key content
+    count: int
 
 
 @router.post("/connect", response_model=ConnectResponse)
@@ -37,6 +44,12 @@ def test_connection(req: ConnectRequest):
     """
     Verify SSH credentials. Called by frontend on the Connect screen.
     Returns connected=true and the logged-in username on success.
+    
+    Authentication methods (in order of precedence):
+    1. private_key: SSH private key content (string)
+    2. key_filename: Path to specific SSH private key file
+    3. Auto-discovery: Automatically find and try SSH keys from ~/.ssh/
+    4. password: Username/password authentication (fallback)
     
     If sudo_password is provided, test that sudo works with the password.
     """
@@ -53,7 +66,7 @@ def test_connection(req: ConnectRequest):
             password=req.password,
             key_filename=req.key_filename,
             port=req.port,
-            sudo_password=req.sudo_password,  # Pass sudo password to executor
+            sudo_password=req.sudo_password,
         )
 
         # Run whoami to confirm connection and get actual username

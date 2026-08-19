@@ -44,9 +44,9 @@ services:
       # Mount config and log directories
       - ./logs:/app/logs
       - ./configs:/app/configs
-      # SSH key mount (optional - only needed for key-based authentication)
-      # Uncomment if using SSH keys instead of passwords:
-      # - ${SSH_KEY_PATH}:/app/.ssh/id_ed25519:ro
+      # Mount user's entire .ssh directory (works for any user)
+      # The ~ expands to the current user's home directory automatically
+      - ~/.ssh:/home/appuser/.ssh:ro
     
     networks:
       - smai_network
