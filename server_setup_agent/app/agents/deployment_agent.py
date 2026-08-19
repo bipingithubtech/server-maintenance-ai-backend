@@ -1197,6 +1197,8 @@ class DeploymentAgent:
     # ── Public entry point ─────────────────────────────────────────────────────
 
     def execute_task(self, query: str) -> str:
+        from app.services.conversation_service import NeedsInputError
+        
         # ── Update executor with sudo_password if provided in prefill ────
         pf = getattr(self, '_prefill', None) or {}
         if pf.get('sudo_password') and hasattr(self.executor, 'sudo_password'):
@@ -1205,7 +1207,29 @@ class DeploymentAgent:
         elif hasattr(self.executor, 'sudo_password') and self.executor.sudo_password:
             logger.info(f"[DEPLOY] ✓ Sudo password loaded from .env")
         elif self.executor_type == "ssh":
-            logger.warning(f"[DEPLOY] ✗ No sudo password available - nginx configuration may fail")
+            # Check if user is root (root may not need sudo password)
+            executor_config = getattr(self, 'executor_config', {})
+            username = executor_config.get('username', 'root')
+            
+            # If not root, sudo password is required for package installation
+            if username != 'root':
+                logger.warning(f"[DEPLOY] ✗ No sudo password available - deployment will fail")
+                raise NeedsInputError(
+                    f"⚠️ **Sudo Password Required**\n\n"
+                    f"Deployment requires sudo privileges to:\n"
+                    f"- Install system packages (nodejs, python3-venv, etc.)\n"
+                    f"- Configure nginx web server\n"
+                    f"- Manage system services\n\n"
+                    f"Please provide the sudo password for user `{username}`:",
+                    {
+                        "step": "need_sudo_password",
+                        "ctx_partial": {},  # Will be filled when context is gathered
+                        "prefill": pf,  # Use pf instead of self._prefill (already safe with getattr)
+                        "agent": "deployment",
+                    }
+                )
+            else:
+                logger.info(f"[DEPLOY] Connected as root - sudo password not required")
         
         # ── Fast-path: resuming after need_nginx question ─────────────────
         # Only skip clone+install if this is a genuine mid-deployment resume:

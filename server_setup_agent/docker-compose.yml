@@ -1,5 +1,3 @@
-version: '3.8'
-
 # ════════════════════════════════════════════════════════════════
 # Load environment variables from .env file
 # Docker Compose automatically loads .env in the same directory
@@ -103,7 +101,9 @@ services:
       # Mount config and log directories
       - ./logs:/app/logs
       - ./configs:/app/configs
-      - ${SSH_KEY_PATH}:/app/.ssh/id_ed25519:ro
+      # SSH key mount (optional - only needed for key-based authentication)
+      # Uncomment if using SSH keys instead of passwords:
+      # - ${SSH_KEY_PATH}:/app/.ssh/id_ed25519:ro
     
     networks:
       - smai_network
