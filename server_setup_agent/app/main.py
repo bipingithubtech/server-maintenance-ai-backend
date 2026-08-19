@@ -11,10 +11,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Allow frontend (Vite on 5173, or any origin in dev)
+# Allow frontend from localhost (dev) and production domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://deploy.meetri.in",  # Production frontend
+        "http://deploy.meetri.in",   # HTTP fallback
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -208,6 +208,26 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_env",
+            "description": "Update or add environment variables to an application's .env file. Automatically backs up the file before editing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_path": {"type": "string", "description": "Path to application directory (e.g., '/home/meetri/api/luna-backend')"},
+                    "env_vars": {
+                        "type": "object",
+                        "description": "Key-value pairs of environment variables to update (e.g., {'PORT': '3000', 'API_KEY': 'new_key'})",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "restart": {"type": "boolean", "description": "Restart the application after updating .env (default: true)"},
+                },
+                "required": ["app_path", "env_vars"],
+            },
+        },
+    },
 ]
 
 # Commands that must get explicit user confirmation before execution
@@ -567,6 +587,89 @@ class OpsAgent:
                 logger.error(f"[SSL] Configuration failed: {e}")
                 return f"❌ SSL configuration failed: {e}\n\nFor debugging, run on server: sudo certbot --nginx -d {domain}"
         
+        if name == "update_env":
+            app_path = args["app_path"].rstrip("/")
+            env_vars = args["env_vars"]
+            restart = args.get("restart", True)
+            
+            app_name = app_path.split("/")[-1]
+            env_file = f"{app_path}/.env"
+            
+            logger.info(f"[OPS] UPDATE ENV: {app_path} - Updating {len(env_vars)} variable(s)")
+            
+            try:
+                # Check if .env file exists
+                result = self._exec(f"test -f {env_file} && echo 'exists' || echo 'not'")
+                file_exists = "exists" in result
+                
+                if file_exists:
+                    # Read current .env file
+                    current_content = self._exec(f"cat {env_file}")
+                    lines = current_content.split("\n")
+                else:
+                    logger.info(f"[OPS] .env file doesn't exist - creating new one")
+                    lines = []
+                
+                # Backup existing file
+                if file_exists:
+                    self._exec(f"cp {env_file} {env_file}.bak.$(date +%s)")
+                
+                # Update or add each variable
+                updated_keys = set()
+                new_lines = []
+                
+                for line in lines:
+                    # Skip empty lines and comments
+                    if not line.strip() or line.strip().startswith("#"):
+                        new_lines.append(line)
+                        continue
+                    
+                    # Parse KEY=VALUE
+                    if "=" in line:
+                        key = line.split("=")[0].strip()
+                        if key in env_vars:
+                            # Update existing key
+                            new_lines.append(f"{key}={env_vars[key]}")
+                            updated_keys.add(key)
+                            logger.info(f"[OPS] Updated: {key}")
+                        else:
+                            # Keep unchanged
+                            new_lines.append(line)
+                    else:
+                        new_lines.append(line)
+                
+                # Add new keys that weren't in the file
+                for key, value in env_vars.items():
+                    if key not in updated_keys:
+                        new_lines.append(f"{key}={value}")
+                        logger.info(f"[OPS] Added: {key}")
+                
+                # Write updated content
+                new_content = "\n".join(new_lines)
+                encoded = base64.b64encode(new_content.encode()).decode()
+                self._exec(f"echo '{encoded}' | base64 --decode > {env_file}")
+                
+                result_msg = f"✅ Updated {len(env_vars)} environment variable(s) in {env_file}\n"
+                result_msg += "\n".join(f"  • {key}" for key in env_vars.keys())
+                
+                # Restart application if requested
+                if restart:
+                    logger.info(f"[OPS] Restarting {app_name} to apply .env changes")
+                    
+                    # Check if app is running in PM2
+                    pm2_check = self._exec(f"pm2 list --no-color | grep {app_name}")
+                    if app_name in pm2_check:
+                        restart_result = self._exec(f"pm2 restart {app_name} --update-env")
+                        result_msg += f"\n\n✅ Application restarted: {app_name}"
+                    else:
+                        result_msg += f"\n\n⚠️ App not found in PM2 - manual restart may be required"
+                
+                return result_msg
+                
+            except Exception as e:
+                logger.error(f"[OPS] UPDATE ENV FAILED: {e}")
+                return f"❌ Failed to update environment variables: {e}"
+        
         return f"Unknown tool: {name}"
 
     @staticmethod
@@ -584,7 +687,18 @@ class OpsAgent:
                 "You are a Linux server operations assistant. You have tools to run "
                 "commands, read/edit files, and audit server state. Use them to "
                 "accomplish exactly what the user asks. Be surgical — don't make "
-                "changes beyond what was requested. Report clearly what you did."
+                "changes beyond what was requested. Report clearly what you did.\n\n"
+                "IMPORTANT: When asked to update environment variables:\n"
+                "1. If the user provides a full path (e.g., /home/user/api/app-name), use it directly\n"
+                "2. If the user only provides an app name, assume it's in /home/meetri/api/APP-NAME\n"
+                "3. NEVER use 'find /' or 'grep -R /home' to search for apps - they are too slow\n"
+                "4. If uncertain about the path, ask the user instead of searching\n"
+                "5. If the user already provided the path in the conversation, USE IT - don't ask again\n"
+                "6. Execute the update immediately if you have both the path and the variables\n\n"
+                "Common app locations:\n"
+                "- /home/meetri/api/APP-NAME\n"
+                "- /opt/APP-NAME\n"
+                "- /var/www/APP-NAME"
             )),
             HumanMessage(content=query),
         ]
