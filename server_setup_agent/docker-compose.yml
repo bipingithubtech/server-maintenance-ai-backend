@@ -6,50 +6,6 @@
 
 services:
   # ════════════════════════════════════════════════════════════════
-  # PostgreSQL Database
-  # ════════════════════════════════════════════════════════════════
-  postgres:
-    image: postgres:15-alpine
-    container_name: smai-postgres
-    environment:
-      POSTGRES_USER: smai_user
-      POSTGRES_PASSWORD: smai_secure_password_2024
-      POSTGRES_DB: server_maintenance_db
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U smai_user -d server_maintenance_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - smai_network
-    restart: unless-stopped
-
-  # ════════════════════════════════════════════════════════════════
-  # Qdrant Vector Database (for embeddings/RAG)
-  # ════════════════════════════════════════════════════════════════
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: smai-qdrant
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    environment:
-      QDRANT_API_KEY: qdrant_api_key_2024
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - smai_network
-    restart: unless-stopped
-
-  # ════════════════════════════════════════════════════════════════
   # FastAPI Application
   # ════════════════════════════════════════════════════════════════
   app:
@@ -72,13 +28,6 @@ services:
       # GitHub (from .env)
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       
-      # Database (internal — app talks to postgres service)
-      DATABASE_URL: postgresql://smai_user:smai_secure_password_2024@postgres:5432/server_maintenance_db
-      
-      # Vector Database (internal — app talks to qdrant service)
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_API_KEY: qdrant_api_key_2024
-      
       # SSH Configuration (from .env)
       SSH_HOST: ${SSH_HOST}
       SSH_PORT: ${SSH_PORT:-22}
@@ -90,12 +39,6 @@ services:
     
     ports:
       - "8000:8000"
-    
-    depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
     
     volumes:
       # Mount config and log directories
@@ -115,33 +58,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-  # ════════════════════════════════════════════════════════════════
-  # Nginx Reverse Proxy (Optional)
-  # ════════════════════════════════════════════════════════════════
-  nginx:
-    image: nginx:alpine
-    container_name: smai-nginx
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/etc/nginx/certs:ro
-    depends_on:
-      - app
-    networks:
-      - smai_network
-    restart: unless-stopped
-
-# ════════════════════════════════════════════════════════════════
-# Volumes
-# ════════════════════════════════════════════════════════════════
-volumes:
-  postgres_data:
-    driver: local
-  qdrant_data:
-    driver: local
 
 # ════════════════════════════════════════════════════════════════
 # Networks
