@@ -1,12 +1,12 @@
 {
-  "github_url": "https://github.com/bipingithubtech/server-maintenance-ai-backend.git",
-  "stack": "fastapi",
-  "port": "8000",
-  "domain": "31.97.224.45",
-  "app_name": "server-maintenance-ai-backend",
-  "app_path": "/home/meetri/api/server-maintenance-ai-backend",
-  "app_type": "backend",
-  "env_file_path": "/home/meetri/api/server-maintenance-ai-backend/.env",
-  "process_manager": "docker",
-  "branch": "server/setup"
+  "github_url": "https://github.com/bipingithubtech/server-maintenance-ai.git",
+  "stack": "vite",
+  "port": "5173",
+  "domain": "deploy.meetri.in",
+  "app_name": "server-maintenance-ai",
+  "app_path": "/home/meetri/api/server-maintenance-ai",
+  "app_type": "frontend",
+  "env_file_path": "/home/meetri/api/server-maintenance-ai/.env",
+  "process_manager": "pm2",
+  "branch": "main"
 }

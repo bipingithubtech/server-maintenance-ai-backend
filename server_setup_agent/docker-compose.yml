@@ -45,8 +45,9 @@ services:
       - ./logs:/app/logs
       - ./configs:/app/configs
       # Mount user's entire .ssh directory (works for any user)
-      # The ~ expands to the current user's home directory automatically
-      - ~/.ssh:/home/appuser/.ssh:ro
+      # For Windows: Use ${USERPROFILE} environment variable
+      # For Linux/Mac: Use ${HOME} environment variable
+      - ${USERPROFILE}/.ssh:/home/appuser/.ssh:ro
     
     networks:
       - smai_network
