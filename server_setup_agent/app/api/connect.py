@@ -40,9 +40,13 @@ def test_connection(req: ConnectRequest):
     
     If sudo_password is provided, test that sudo works with the password.
     """
+    from loguru import logger
+    
     try:
         from app.executors.ssh_executor import SSHExecutor
 
+        logger.info(f"[API] Testing connection to {req.username}@{req.host}:{req.port}")
+        
         executor = SSHExecutor(
             host=req.host,
             username=req.username,
@@ -55,9 +59,12 @@ def test_connection(req: ConnectRequest):
         # Run whoami to confirm connection and get actual username
         exit_code, out, err = executor._run("whoami")
         if exit_code != 0:
-            return ConnectResponse(connected=False, error=err or "Connection failed")
+            error_msg = err or "Connection failed"
+            logger.error(f"[API] Connection test failed: {error_msg}")
+            return ConnectResponse(connected=False, error=error_msg)
 
         username = out.strip()
+        logger.info(f"[API] ✓ Connected as {username}")
         
         # If sudo_password provided, test that sudo works
         if req.sudo_password:
@@ -72,4 +79,5 @@ def test_connection(req: ConnectRequest):
         )
 
     except Exception as e:
+        logger.error(f"[API] ✗ Connection failed with exception: {str(e)}")
         return ConnectResponse(connected=False, error=str(e))

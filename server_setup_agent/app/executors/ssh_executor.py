@@ -45,18 +45,45 @@ class SSHExecutor(BaseExecutor):
         self._local = threading.local()  # per-thread client
 
     def _connect(self) -> paramiko.SSHClient:
+        from loguru import logger
+        
         client = paramiko.SSHClient()
+        # Accept all host keys automatically (ignore host key verification)
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=self.host,
-            port=self.port,
-            username=self.username,
-            password=self.password,
-            key_filename=self.key_filename,
-            timeout=30,
-            banner_timeout=60,
-            auth_timeout=30,
-        )
+        
+        # Also load system host keys if available
+        try:
+            client.load_system_host_keys()
+        except Exception as e:
+            logger.debug(f"[SSH] Could not load system host keys: {e}")
+        
+        logger.info(f"[SSH] Connecting to {self.username}@{self.host}:{self.port}")
+        
+        try:
+            client.connect(
+                hostname=self.host,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                key_filename=self.key_filename,
+                timeout=30,
+                banner_timeout=60,
+                auth_timeout=30,
+                look_for_keys=True,  # Look for SSH keys
+                allow_agent=True,     # Allow SSH agent
+                disabled_algorithms=dict()  # Don't disable any algorithms
+            )
+            logger.info(f"[SSH] ✓ Connected successfully to {self.host}")
+        except paramiko.AuthenticationException as e:
+            logger.error(f"[SSH] ✗ Authentication failed for {self.username}@{self.host}: {e}")
+            raise Exception(f"Authentication failed: Invalid username or password")
+        except paramiko.SSHException as e:
+            logger.error(f"[SSH] ✗ SSH error connecting to {self.host}: {e}")
+            raise Exception(f"SSH connection error: {e}")
+        except Exception as e:
+            logger.error(f"[SSH] ✗ Failed to connect to {self.host}:{self.port}: {e}")
+            raise Exception(f"Connection failed: {e}")
+        
         # Keep connection alive every 30s to prevent server dropping idle SSH
         transport = client.get_transport()
         if transport:
