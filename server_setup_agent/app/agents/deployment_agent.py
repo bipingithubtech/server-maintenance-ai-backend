@@ -1003,7 +1003,8 @@ class DeploymentAgent:
         self._run(f"sudo docker build -t {ctx.app_name} {ctx.app_path}")
 
         # Run container
-        env_flags = " ".join(f"-e {k}={v}" for k, v in ctx.env_vars.items())
+        # Properly quote env values to handle special characters and spaces
+        env_flags = " ".join(f'-e "{k}={v}"' for k, v in ctx.env_vars.items())
         self._run(
             f"sudo docker run -d --name {ctx.app_name} "
             f"--restart unless-stopped "
