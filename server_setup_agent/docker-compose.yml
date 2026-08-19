@@ -45,9 +45,10 @@ services:
       - ./logs:/app/logs
       - ./configs:/app/configs
       # Mount user's entire .ssh directory (works for any user)
-      # For Windows: Use ${USERPROFILE} environment variable
-      # For Linux/Mac: Use ${HOME} environment variable
-      - ${USERPROFILE}/.ssh:/home/appuser/.ssh:ro
+      # For Windows: Use ${USERPROFILE} (C:\Users\Username)
+      # For Linux: Use ${HOME} (/home/username)
+      # The variable automatically adapts to the OS
+      - ${USERPROFILE:-${HOME}}/.ssh:/home/appuser/.ssh:ro
     
     networks:
       - smai_network
