@@ -33,6 +33,7 @@ class SSHExecutor(BaseExecutor):
         username: str,
         password: Optional[str] = None,
         key_filename: Optional[str] = None,
+        private_key: Optional[str] = None,  # NEW: Private key content as string
         port: int = 22,
         sudo_password: Optional[str] = None
     ):
@@ -41,13 +42,25 @@ class SSHExecutor(BaseExecutor):
         self.password = password
         self.port = port
         self.sudo_password = sudo_password  # Password for sudo commands
+        self.private_key_content = private_key  # Store private key content
         self._local = threading.local()  # per-thread client
         
-        # Auto-discover SSH keys if not provided
-        if key_filename:
+        # Priority order for authentication:
+        # 1. private_key (content from frontend) - highest priority
+        # 2. key_filename (specific file path)
+        # 3. Auto-discovery (look in ~/.ssh/)
+        # 4. password (fallback)
+        
+        if private_key:
+            # Private key content provided - will use this directly
+            self.key_filename = None
+            from loguru import logger
+            logger.info("[SSH] Using private key content from request")
+        elif key_filename:
+            # Specific key file provided
             self.key_filename = key_filename
         else:
-            # Look for common SSH key files in ~/.ssh/
+            # Auto-discover SSH keys if not provided
             self.key_filename = self._discover_ssh_keys()
     
     def _discover_ssh_keys(self) -> Optional[list]:
@@ -126,6 +139,7 @@ class SSHExecutor(BaseExecutor):
     def _connect(self) -> paramiko.SSHClient:
         from loguru import logger
         import os
+        from io import StringIO
         
         client = paramiko.SSHClient()
         # Accept all host keys automatically (ignore host key verification)
@@ -137,12 +151,61 @@ class SSHExecutor(BaseExecutor):
         except Exception as e:
             logger.debug(f"[SSH] Could not load system host keys: {e}")
         
-        # Determine authentication method
-        auth_method = "key" if self.key_filename else "password" if self.password else "agent/default"
-        logger.info(f"[SSH] Connecting to {self.username}@{self.host}:{self.port} using {auth_method} authentication")
+        # Prepare authentication parameters
+        # Default: allow auto-discovery
+        connect_kwargs = {
+            "hostname": self.host,
+            "port": self.port,
+            "username": self.username,
+            "timeout": 30,
+            "banner_timeout": 60,
+            "auth_timeout": 30,
+            "look_for_keys": True,  # Will be disabled if explicit key provided
+            "allow_agent": True,     # Will be disabled if explicit key provided
+            "disabled_algorithms": dict()
+        }
         
-        # Log key files if provided
-        if self.key_filename:
+        # Handle private key content (highest priority)
+        pkey = None
+        if self.private_key_content:
+            try:
+                # Parse private key content into paramiko key object
+                key_file = StringIO(self.private_key_content)
+                
+                # Try different key types (Ed25519, RSA, ECDSA)
+                # Note: DSS/DSA keys are deprecated and not supported
+                for key_class in [paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey]:
+                    try:
+                        pkey = key_class.from_private_key(key_file)
+                        logger.info(f"[SSH] ✓ Loaded {key_class.__name__} from private key content")
+                        break
+                    except Exception:
+                        key_file.seek(0)  # Reset for next attempt
+                        continue
+                
+                if pkey:
+                    connect_kwargs["pkey"] = pkey
+                    # IMPORTANT: Disable auto-discovery when explicit key is provided
+                    # This ensures only the provided key is used (proper identity enforcement)
+                    connect_kwargs["look_for_keys"] = False
+                    connect_kwargs["allow_agent"] = False
+                    auth_method = "private_key_content"
+                    logger.info("[SSH] Using ONLY the provided private key (auto-discovery disabled)")
+                else:
+                    raise Exception("Could not parse private key content. Supported formats: Ed25519, RSA, ECDSA (OpenSSH or PEM format).")
+                    
+            except Exception as e:
+                logger.error(f"[SSH] ✗ Failed to load private key from content: {e}")
+                raise Exception(f"Invalid private key: {e}")
+        
+        # Handle key filename (second priority)
+        elif self.key_filename:
+            connect_kwargs["key_filename"] = self.key_filename
+            # Disable auto-discovery when specific key file is provided
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+            auth_method = "key_file"
+            logger.info("[SSH] Using specified key file (auto-discovery disabled)")
             if isinstance(self.key_filename, list):
                 logger.debug(f"[SSH] Using key files: {', '.join(self.key_filename)}")
             else:
@@ -151,20 +214,21 @@ class SSHExecutor(BaseExecutor):
                 else:
                     logger.warning(f"[SSH] ⚠ Key file not found: {self.key_filename}")
         
+        # Handle password (fallback)
+        elif self.password:
+            connect_kwargs["password"] = self.password
+            # Disable key-based auth when password is explicitly provided
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+            auth_method = "password"
+            logger.info("[SSH] Using password authentication (key auth disabled)")
+        else:
+            auth_method = "agent/default"
+        
+        logger.info(f"[SSH] Connecting to {self.username}@{self.host}:{self.port} using {auth_method} authentication")
+        
         try:
-            client.connect(
-                hostname=self.host,
-                port=self.port,
-                username=self.username,
-                password=self.password,
-                key_filename=self.key_filename,
-                timeout=30,
-                banner_timeout=60,
-                auth_timeout=30,
-                look_for_keys=True,  # Look for SSH keys in ~/.ssh/
-                allow_agent=True,     # Allow SSH agent
-                disabled_algorithms=dict()  # Don't disable any algorithms
-            )
+            client.connect(**connect_kwargs)
             logger.info(f"[SSH] ✓ Connected successfully to {self.host}")
         except paramiko.AuthenticationException as e:
             error_msg = str(e)
@@ -173,8 +237,8 @@ class SSHExecutor(BaseExecutor):
             # Provide helpful error message based on error type
             if "publickey" in error_msg.lower():
                 raise Exception(f"Authentication failed: Server only accepts SSH key authentication. Password login is disabled. Please provide a valid SSH private key.")
-            elif self.key_filename:
-                raise Exception(f"Authentication failed: SSH key rejected. Verify the key is authorized on the server.")
+            elif self.private_key_content or self.key_filename:
+                raise Exception(f"Authentication failed: SSH key rejected. The private key doesn't match any authorized public key on the server.")
             else:
                 raise Exception(f"Authentication failed: Invalid username or password")
         except paramiko.SSHException as e:

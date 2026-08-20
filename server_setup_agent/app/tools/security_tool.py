@@ -130,6 +130,69 @@ class SecurityTool:
 
         return f"User '{username}' created with sudo access and password set."
 
+    def add_sudo_user_with_key(self, username: str, public_key: str) -> str:
+        """
+        Creates a new sudo-enabled user with SSH key authentication only (no password).
+        This is the recommended method for adding team members to an existing server.
+        
+        The user will ONLY be able to login via SSH key (password login disabled for this user).
+        Grants passwordless sudo so commands work over SSH without a TTY.
+        
+        Args:
+            username: Linux username to create
+            public_key: SSH public key string (ssh-ed25519 AAAA... or ssh-rsa AAAA...)
+            
+        Returns:
+            Success message
+            
+        Raises:
+            RuntimeError: If user creation or key installation fails
+        """
+        username_q = shlex.quote(username)
+
+        # Create user if not exists
+        code, _, _ = self.executor.execute(f"id -u {username_q}")
+        if code != 0:
+            exit_code, out, err = self.executor.execute(
+                f"sudo adduser --disabled-password --gecos '' {username_q}"
+            )
+            if exit_code != 0:
+                raise RuntimeError(f"Failed to create user {username}:\n{err}")
+
+        # Note: --disabled-password flag already ensures no password login
+        # We don't use usermod -L because it locks the entire account,
+        # preventing even SSH key authentication on some systems
+
+        # Add to sudo group
+        exit_code, _, err = self.executor.execute(f"sudo usermod -aG sudo {username_q}")
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to add {username} to sudo group:\n{err}")
+
+        # Grant passwordless sudo so agent commands work over SSH without a TTY
+        sudoers_line = shlex.quote(f"{username} ALL=(ALL) NOPASSWD:ALL")
+        self.executor.execute(
+            f"echo {sudoers_line} | sudo tee /etc/sudoers.d/{username_q} > /dev/null && "
+            f"sudo chmod 440 /etc/sudoers.d/{username_q}"
+        )
+
+        # Install SSH public key (required - this is the only way to login)
+        if not public_key or not public_key.strip():
+            raise ValueError("public_key is required for key-only authentication")
+            
+        pubkey_q = shlex.quote(public_key.strip())
+        cmd = (
+            f"sudo mkdir -p /home/{username_q}/.ssh && "
+            f"echo {pubkey_q} | sudo tee /home/{username_q}/.ssh/authorized_keys > /dev/null && "
+            f"sudo chmod 700 /home/{username_q}/.ssh && "
+            f"sudo chmod 600 /home/{username_q}/.ssh/authorized_keys && "
+            f"sudo chown -R {username_q}:{username_q} /home/{username_q}/.ssh"
+        )
+        exit_code, _, err = self.executor.execute(cmd)
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to set up SSH key for {username}:\n{err}")
+
+        return f"User '{username}' created with sudo access and SSH key authentication (password login disabled)."
+
     # ── SSH hardening ─────────────────────────────────────────────────────
 
     def _set_sshd_option(self, key: str, value: str) -> None:

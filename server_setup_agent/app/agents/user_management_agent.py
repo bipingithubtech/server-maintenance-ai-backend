@@ -39,6 +39,7 @@ from app.tools.ssh_tool import SSHTool
 from app.tools.linux_tool import LinuxTool
 from app.services.teams_alert_service import TeamsAlerter
 from app.services.llm_service import get_llm
+from app.services.conversation_service import NeedsInputError
 from langchain_core.messages import SystemMessage, HumanMessage
 
 
@@ -117,9 +118,23 @@ class UserManagementAgent:
                 "Expected format: ssh-ed25519 AAAA... user@machine"
             )
 
+        # Check if sudo password is available
+        if not hasattr(self.executor, 'sudo_password') or not self.executor.sudo_password:
+            raise NeedsInputError(
+                f"⚠️ **Sudo Password Required**\n\n"
+                f"Creating a new user requires sudo privileges.\n\n"
+                f"Please provide the sudo password:",
+                {
+                    "step": "need_sudo_password_user_mgmt",
+                    "username": username,
+                    "public_key": public_key,
+                    "agent": "user_management"
+                }
+            )
+
         logger.info(f"[USER-MGMT] Adding user: {username} on {self.server_label}")
         try:
-            result = self.security.bootstrap_sudo_user(username, public_key)
+            result = self.security.add_sudo_user_with_key(username, public_key)
             self.alerter.info(
                 title=f"New user added: {username}",
                 server=self.server_label,
@@ -264,9 +279,12 @@ class UserManagementAgent:
     # ── Natural-language entry point ───────────────────────────────────────────
 
     def execute_task(self, query: str) -> str:
-        """Parse the user's intent via LLM and dispatch to the right action."""
+        """
+        Parse the user's intent via LLM and dispatch to the right action.
+        """
         import json, time
 
+        # Normal flow - parse the query
         messages = [
             SystemMessage(content=_INTENT_SYSTEM),
             HumanMessage(content=query),
@@ -291,46 +309,74 @@ class UserManagementAgent:
             public_key = data.get("public_key", "").strip()
             notes      = data.get("notes", "").strip()
 
-            # LLM flagged something missing
+            # LLM flagged something missing - but we already have context (username/key provided)
             if notes:
-                print(f"\n[?] {notes}")
-                answer = input("    Your answer: ").strip()
-                messages.append(response)
-                messages.append(HumanMessage(content=answer))
-                continue
+                # If we have username AND public_key, the LLM successfully parsed them
+                # Just proceed with the action even if there's a note
+                if username and public_key and action == "add_user":
+                    return self.add_user(username, public_key)
+                
+                # Otherwise return the note as JSON for frontend
+                return json.dumps({
+                    "status": "need_input",
+                    "prompt": notes,
+                    "action": action,
+                    "username": username,
+                    "public_key": public_key
+                })
 
             # Dispatch
             if action == "add_user":
                 if not public_key:
-                    print(f"\n[?] Please provide the SSH public key for '{username}':")
-                    public_key = input("    Public key: ").strip()
+                    return json.dumps({
+                        "status": "need_input",
+                        "prompt": f"Please provide the SSH public key for user '{username}'",
+                        "action": "add_user",
+                        "username": username,
+                        "field_needed": "public_key"
+                    })
                 return self.add_user(username, public_key)
 
             elif action == "remove_user":
-                confirm = input(
-                    f"\n[!] This will DELETE user '{username}' and their home directory. "
-                    f"Are you sure? (yes/no): "
-                ).strip().lower()
-                if not confirm.startswith("y"):
-                    return "Cancelled — user not removed."
-                return self.remove_user(username)
+                return json.dumps({
+                    "status": "need_confirmation",
+                    "prompt": f"This will DELETE user '{username}' and their home directory. Are you sure?",
+                    "action": "remove_user",
+                    "username": username,
+                    "confirmation_required": True
+                })
 
             elif action == "list_users":
                 return self.list_users()
 
             elif action == "add_key":
                 if not public_key:
-                    print(f"\n[?] Please provide the additional SSH public key for '{username}':")
-                    public_key = input("    Public key: ").strip()
+                    return json.dumps({
+                        "status": "need_input",
+                        "prompt": f"Please provide the additional SSH public key for '{username}'",
+                        "action": "add_key",
+                        "username": username,
+                        "field_needed": "public_key"
+                    })
                 return self.add_key_to_user(username, public_key)
 
             elif action == "rotate_key":
                 if not public_key:
-                    print(f"\n[?] Please provide your new SSH public key:")
-                    public_key = input("    New public key: ").strip()
+                    return json.dumps({
+                        "status": "need_input",
+                        "prompt": "Please provide your new SSH public key",
+                        "action": "rotate_key",
+                        "username": username,
+                        "field_needed": "public_key"
+                    })
                 return self.rotate_my_key(username, public_key)
 
             else:
+                # Unknown action - but check if we have username + key, assume add_user
+                if username and public_key:
+                    logger.info(f"[USER-MGMT] Unknown action but have username+key, assuming add_user")
+                    return self.add_user(username, public_key)
+                
                 return (
                     "I can help with:\n"
                     "  • Add a user:     'add user alice with key ssh-ed25519 AAAA...'\n"

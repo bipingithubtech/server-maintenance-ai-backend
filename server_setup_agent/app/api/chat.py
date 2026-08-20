@@ -1,13 +1,44 @@
 from fastapi import APIRouter, HTTPException
 from loguru import logger
-from typing import Optional
+from typing import Optional, Union
+import os
 
 from app.agents.supervisor import supervisor
-from app.api.schemas import QueryRequest, QueryResponse
+from app.api.schemas import QueryRequest, QueryResponse, EncryptedRequest
 from app.services.sanitizer_service import register_credentials, clear_credentials
 from app.services.conversation_service import NeedsInputError, conversation_store
+from app.utils.encryption import decrypt_payload
 
 router = APIRouter()
+
+
+def decrypt_query_if_needed(req: Union[QueryRequest, EncryptedRequest]) -> QueryRequest:
+    """
+    Decrypt the request if it's encrypted, otherwise return as-is.
+    
+    Args:
+        req: Either plain QueryRequest or EncryptedRequest
+        
+    Returns:
+        Decrypted QueryRequest
+    """
+    # If it's already a QueryRequest, return it
+    if isinstance(req, QueryRequest):
+        return req
+    
+    # If it has encrypted_data, decrypt it
+    if hasattr(req, 'encrypted_data'):
+        encryption_key = os.getenv('ENCRYPTION_KEY', 'my-super-secret-encryption-key')
+        
+        try:
+            decrypted_data = decrypt_payload(req.encrypted_data, encryption_key)
+            logger.info("[API] ✓ Decrypted query payload")
+            return QueryRequest(**decrypted_data)
+        except Exception as e:
+            logger.error(f"[API] ✗ Decryption failed: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Decryption failed: {str(e)}")
+    
+    raise HTTPException(status_code=400, detail="Invalid request format")
 
 
 def _dispatch(agent_name: str, query: str, request: QueryRequest) -> str:
@@ -143,7 +174,10 @@ def _pre_route(query: str) -> Optional[str]:
 
 
 @router.post("/query", response_model=QueryResponse)
-async def handle_query(request: QueryRequest):
+async def handle_query(request: Union[QueryRequest, EncryptedRequest]):
+    # Decrypt if needed
+    request = decrypt_query_if_needed(request)
+    
     creds = request.credentials
     if creds:
         register_credentials(
@@ -365,6 +399,37 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
             prefill["port_conflict_answer"] = "continue"
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
+
+    elif step == "need_sudo_password_user_mgmt":
+        # User provided sudo password for user management
+        sudo_password = user_answer.strip()
+        if not sudo_password:
+            return QueryResponse(agent=agent_name, reason="Cancelled", result="User creation cancelled - no password provided.")
+        
+        username = agent_state.get("username", "")
+        public_key = agent_state.get("public_key", "")
+        
+        # Get credentials from request
+        creds = request.credentials
+        if not creds and "request" in state:
+            orig_creds_dict = state.get("request", {}).get("credentials")
+            if orig_creds_dict:
+                from app.api.schemas import ServerCredentials
+                creds = ServerCredentials(**orig_creds_dict)
+        
+        # Add sudo_password to credentials
+        if creds:
+            creds.sudo_password = sudo_password
+        
+        executor_type = creds.executor_type if creds else "local"
+        executor_config = creds.to_config() if creds else {}
+        label = executor_config.get("host", "server")
+        
+        # Recreate agent with sudo password
+        from app.agents.user_management_agent import UserManagementAgent
+        agent = UserManagementAgent(executor_type=executor_type, executor_config=executor_config, server_label=label)
+        result = agent.add_user(username, public_key)
+        return QueryResponse(agent=agent_name, reason="Resumed conversation", result=result)
 
     elif step == "need_sudo_password":
         # User provided their sudo password

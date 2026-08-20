@@ -3,6 +3,11 @@ from typing import Optional, Dict, Any
 from app.core.config import settings
 
 
+class EncryptedRequest(BaseModel):
+    """Request model for encrypted payloads from frontend"""
+    encrypted_data: str
+
+
 class ServerCredentials(BaseModel):
     """
     Secure schema to accept target server credentials from the frontend.
@@ -12,10 +17,17 @@ class ServerCredentials(BaseModel):
     host: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
-    key_filename: Optional[str] = None
+    key_filename: Optional[str] = None  # Path to private key file on server
+    private_key: Optional[str] = None   # Private key content (string) from frontend
+    ssh_key: Optional[str] = None       # Alias for private_key (for backward compatibility)
     port: int = 22
     github_token: Optional[str] = None  # PAT for cloning private GitHub repos
     sudo_password: Optional[str] = None  # Password for sudo commands (can be same as password)
+    
+    def model_post_init(self, __context):
+        # Support both 'ssh_key' and 'private_key' field names
+        if self.ssh_key and not self.private_key:
+            self.private_key = self.ssh_key
 
     @model_validator(mode="after")
     def apply_ssh_defaults(self) -> "ServerCredentials":
@@ -44,6 +56,7 @@ class ServerCredentials(BaseModel):
             "username":     self.username,
             "password":     self.password,
             "key_filename": self.key_filename,
+            "private_key":  self.private_key,
             "port":         self.port,
             "sudo_password": self.sudo_password,
         }
