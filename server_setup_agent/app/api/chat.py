@@ -116,6 +116,11 @@ def _dispatch(agent_name: str, query: str, request: QueryRequest) -> str:
         agent = OpsAgent(executor_type=executor_type, executor_config=executor_config, server_label=label)
         return agent.execute_task(query)
 
+    if agent_name == "general":
+        from app.agents.general_agent import GeneralAgent
+        agent = GeneralAgent()
+        return agent.execute_task(query)
+
     return f"The '{agent_name}' agent is not yet fully implemented."
 
 
