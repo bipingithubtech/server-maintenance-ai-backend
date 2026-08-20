@@ -1,0 +1,731 @@
+═══════════════════════════════════════════════════════════════════════════════
+ FRONTEND PROMPTS GUIDE — Server Maintenance AI Chat Interface
+═══════════════════════════════════════════════════════════════════════════════
+
+This guide provides all the natural language prompts you can use in the chat
+interface to manage your server, applications, and infrastructure.
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 1: APPLICATION DEPLOYMENT
+═══════════════════════════════════════════════════════════════════════════════
+
+PROMPT 1A: Deploy New Application from GitHub
+──────────────────────────────────────────────
+
+"Deploy luna-backend from github.com/myrepo/luna-backend"
+
+or
+
+"I want to deploy a new backend app. Repository: github.com/myrepo/api-server
+Process manager: PM2
+Port: 3000"
+
+What happens:
+- AI clones the repository
+- Installs dependencies (npm install or pip install)
+- Builds the application (npm run build)
+- Starts with PM2 on specified port
+- Saves PM2 process for auto-start on reboot
+- Returns confirmation with app URL
+
+Expected response:
+✅ Application deployed successfully
+App: luna-backend
+Port: 3000
+Status: online
+Logs: pm2 logs luna-backend
+
+
+PROMPT 1B: Deploy with Docker
+──────────────────────────────
+
+"Deploy docker-app as Docker container at /home/meetri/apps/docker-app"
+
+or
+
+"Setup Docker deployment for my-service. Path: /opt/services/my-service.
+Use docker-compose.yml"
+
+What happens:
+- AI builds Docker image from Dockerfile
+- Runs docker-compose up -d
+- Verifies container is running
+- Returns container status
+
+Expected response:
+✅ Docker container deployed successfully
+Container: my-service
+Status: running
+Ports: 8000:8000
+
+
+PROMPT 1C: Deploy with Branch Selection
+────────────────────────────────────────
+
+"Deploy pm-frontend from github.com/myrepo/frontend branch staging"
+
+What happens:
+- AI clones the repository
+- Checks out the staging branch
+- Installs and builds
+- Starts with PM2
+
+Useful for: Testing features before production
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 2: APPLICATION MANAGEMENT (PM2)
+═══════════════════════════════════════════════════════════════════════════════
+
+PROMPT 2A: Start an Application
+────────────────────────────────
+
+"start pm-frontend"
+
+or
+
+"start the pm-frontend application on port 3000"
+
+What happens:
+- If already running: restarts it (pm2 restart)
+- If not running: starts it (pm2 start)
+- Verifies it's online
+- Returns status
+
+Expected response:
+✅ App 'pm-frontend' started
+Status: online
+PID: 1234
+Port: 3000
+
+
+PROMPT 2B: View Application Status
+──────────────────────────────────
+
+"show me pm2 status"
+
+or
+
+"what applications are running?"
+
+or
+
+"pm2 list"
+
+What happens:
+- Lists all PM2 processes
+- Shows status (online/offline/errored)
+- Shows CPU and memory usage
+- Shows restart count
+
+Expected response:
+PM2 Process List:
+┌─────────┬──────┬────────┬───────┬──────┬───────┐
+│ Name    │ PID  │ Status │ CPU%  │ Mem% │ Count │
+├─────────┼──────┼────────┼───────┼──────┼───────┤
+│ pm-front│ 1234 │ online │ 2.3%  │ 45MB │ 1     │
+│ backend │ 5678 │ online │ 5.1%  │ 120MB│ 3     │
+└─────────┴──────┴────────┴───────┴──────┴───────┘
+
+
+PROMPT 2C: View Application Logs
+────────────────────────────────
+
+"show me logs for pm-frontend"
+
+or
+
+"pm-frontend logs last 100 lines"
+
+or
+
+"show logs for backend application"
+
+What happens:
+- Fetches last 50 lines of PM2 logs
+- Shows error messages, warnings, and info
+
+Expected response:
+[PM2] Logs for pm-frontend (last 50 lines):
+
+2026-08-20 10:15:23 [pm-frontend] App started on port 3000
+2026-08-20 10:15:24 [pm-frontend] Connected to database
+2026-08-20 10:16:45 [pm-frontend] Request GET /api/users - 200 OK
+...
+
+
+PROMPT 2D: Stop an Application
+───────────────────────────────
+
+"stop pm-frontend"
+
+or
+
+"stop the backend app"
+
+What happens:
+- Stops the PM2 process
+- Keeps it registered (doesn't delete)
+- Can restart later
+
+Expected response:
+✅ App 'pm-frontend' stopped
+Status: stopped
+
+
+PROMPT 2E: Restart an Application
+──────────────────────────────────
+
+"restart pm-frontend"
+
+or
+
+"restart the backend application"
+
+What happens:
+- Gracefully stops the app
+- Starts it again
+- All connections are reestablished
+
+Expected response:
+✅ App 'pm-frontend' restarted
+Status: online
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 3: APPLICATION REDEPLOY & UPDATES
+═══════════════════════════════════════════════════════════════════════════════
+
+PROMPT 3A: Redeploy Existing Application
+─────────────────────────────────────────
+
+"redeploy pm-frontend"
+
+or
+
+"update pm-frontend from latest code"
+
+What happens:
+1. Navigates to app directory
+2. Runs: git pull (fetches latest code)
+3. Runs: npm install (installs dependencies)
+4. Runs: npm run build (builds the app)
+5. Runs: pm2 restart (restarts with new code)
+
+Expected response:
+✅ Application redeployed successfully
+- Git pull: 5 files changed
+- npm install: 124 packages updated
+- npm run build: Build completed
+- pm2 restart: Process restarted
+Status: online
+
+
+PROMPT 3B: Redeploy from Specific Branch
+──────────────────────────────────────────
+
+"redeploy pm-frontend from branch staging"
+
+or
+
+"deploy pm-frontend branch develop"
+
+What happens:
+1. Navigates to app directory
+2. Checks out specified branch (git checkout staging)
+3. Pulls latest changes (git pull)
+4. Installs dependencies
+5. Builds application
+6. Restarts with PM2
+
+Expected response:
+✅ Application redeployed from staging branch
+- Checked out: staging
+- Git pull: 12 files changed
+- Build: successful
+- Status: online
+
+
+PROMPT 3C: Redeploy Docker Application
+──────────────────────────────────────
+
+"redeploy docker-app"
+
+or
+
+"update Docker container my-service"
+
+What happens:
+1. Runs: git pull
+2. Runs: docker compose down (stops containers)
+3. Runs: docker compose build (rebuilds images)
+4. Runs: docker compose up -d (starts containers)
+
+Expected response:
+✅ Docker application redeployed
+- Image built: my-service:latest
+- Containers started: 2
+- Status: running
+
+
+PROMPT 3D: Update Environment Variables
+───────────────────────────────────────
+
+"update environment variables for pm-frontend"
+
+or
+
+"change .env for backend: DATABASE_URL=postgresql://localhost/mydb
+API_KEY=sk-1234567890"
+
+What happens:
+- Updates the .env file
+- Restarts PM2 process with new env vars
+- Applies changes immediately
+
+Expected response:
+✅ Updated 2 environment variables in /home/meetri/ui/pm-frontend/.env
+- DATABASE_URL
+- API_KEY
+Application restarted with new environment
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 4: NGINX & SSL CONFIGURATION
+═══════════════════════════════════════════════════════════════════════════════
+
+PROMPT 4A: Configure Nginx for Application
+────────────────────────────────────────────
+
+"Configure Nginx for pm-frontend on port 3000 with domain deploy.meetri.in"
+
+or
+
+"Setup Nginx proxy for luna-backend. Domain: api.meetri.in, Port: 3000"
+
+What happens:
+- Checks if Nginx is installed (installs if needed)
+- Generates Nginx config for reverse proxy
+- Saves config to /etc/nginx/sites-available/
+- Enables the site
+- Reloads Nginx
+- App becomes accessible at the domain
+
+Expected response:
+✅ Nginx configured successfully
+Domain: deploy.meetri.in
+Port: 3000
+Access: http://deploy.meetri.in
+Config: /etc/nginx/sites-available/deploy.meetri.in
+
+
+PROMPT 4B: Setup SSL Certificate
+─────────────────────────────────
+
+"Setup SSL certificate for deploy.meetri.in using admin@meetri.in"
+
+or
+
+"Configure Let's Encrypt SSL for api.meetri.in"
+
+Prerequisites:
+- Domain DNS must point to this server
+- Ports 80 and 443 must be accessible
+
+What happens:
+- Requests certificate from Let's Encrypt
+- Installs certificate to /etc/letsencrypt/live/
+- Updates Nginx to use HTTPS
+- Sets up HTTP → HTTPS redirect
+- Enables auto-renewal (30 days before expiration)
+
+Expected response:
+✅ SSL certificate successfully obtained
+Domain: deploy.meetri.in
+Access: https://deploy.meetri.in
+Certificate path: /etc/letsencrypt/live/deploy.meetri.in/
+Auto-renewal: Enabled
+
+
+PROMPT 4C: Configure Nginx + SSL (Complete Setup)
+──────────────────────────────────────────────────
+
+"Setup complete Nginx + SSL for pm-frontend on deploy.meetri.in"
+
+or
+
+"Deploy pm-frontend with full HTTPS: domain deploy.meetri.in, port 3000,
+email admin@meetri.in"
+
+What happens:
+1. Installs Nginx
+2. Generates HTTP config
+3. Requests SSL certificate
+4. Updates config to HTTPS
+5. Enables and reloads Nginx
+
+Expected response:
+✅ Application fully configured with Nginx + SSL
+- Nginx: running
+- Domain: deploy.meetri.in
+- Port: 3000
+- SSL: enabled
+- Access: https://deploy.meetri.in
+- Auto-renewal: enabled
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 5: MONITORING & HEALTH CHECKS
+═══════════════════════════════════════════════════════════════════════════════
+
+PROMPT 5A: Server Health Check
+──────────────────────────────
+
+"health check"
+
+or
+
+"are all services running?"
+
+or
+
+"check server health"
+
+What happens:
+- Checks PM2 applications status
+- Checks Docker containers status
+- Checks Nginx status
+- Checks system resources (CPU/RAM/Disk)
+- Auto-restarts failed services
+- Sends alerts if issues found
+
+Expected response:
+✅ Server Health Check - All Green
+
+PM2 Applications:
+  ✅ pm-frontend (online)
+  ✅ luna-backend (online)
+
+Docker Containers:
+  ✅ my-service (running)
+
+Nginx:
+  ✅ running
+
+System Resources:
+  CPU: 35% (ok)
+  RAM: 42% (ok)
+  Disk: 65% (ok)
+
+
+PROMPT 5B: Show Server Information
+──────────────────────────────────
+
+"show me the server"
+
+or
+
+"what's installed?"
+
+or
+
+"server configuration"
+
+What happens:
+- Shows OS and kernel version
+- Lists installed packages
+- Shows all applications
+- Shows disk usage
+- Shows network configuration
+
+Expected response:
+Server Information:
+  OS: Ubuntu 22.04 LTS
+  Kernel: 5.15.0-56
+  
+Installed Applications:
+  - Node.js 18.12.0
+  - npm 8.19.2
+  - Docker 20.10.17
+  - Nginx 1.18.0
+  - PM2 5.3.0
+
+Disk Usage:
+  / : 65% (150GB / 230GB)
+  /home : 42% (85GB / 200GB)
+
+
+PROMPT 5C: Get Service Health Alert to Teams
+─────────────────────────────────────────────
+
+The system automatically sends Microsoft Teams alerts when:
+- PM2 application crashes or stops
+- Docker container exits
+- Nginx service fails
+- CPU usage exceeds 80%
+- RAM usage exceeds 85%
+- Disk usage exceeds 90%
+- Multiple failed SSH login attempts (security)
+
+Alert Example:
+┌─────────────────────────────────────────┐
+│ 🚨 PM2 App Crashed                     │
+├─────────────────────────────────────────┤
+│ App: luna-backend                      │
+│ Status: offline → online               │
+│ Time: 2026-08-20 10:15:23              │
+│ Action: Auto-restarted                 │
+└─────────────────────────────────────────┘
+
+You don't need to ask for alerts - they happen automatically.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 6: FIREWALL MANAGEMENT
+═══════════════════════════════════════════════════════════════════════════════
+
+PROMPT 6A: Check Firewall Status
+─────────────────────────────────
+
+"show firewall status"
+
+or
+
+"what ports are open?"
+
+What happens:
+- Shows if firewall is enabled/disabled
+- Lists all open ports
+- Shows allowed and denied rules
+
+Expected response:
+Status: active
+
+Allowed Ports:
+  22/tcp (SSH)
+  80/tcp (HTTP)
+  443/tcp (HTTPS)
+  3000/tcp (App)
+  5173/tcp (Dev)
+
+
+PROMPT 6B: Allow a Port
+───────────────────────
+
+"allow port 3000"
+
+or
+
+"open port 8080 for TCP traffic"
+
+What happens:
+- Adds rule: sudo ufw allow 3000/tcp
+- Port becomes accessible
+- Rule persists after reboot
+
+Expected response:
+✅ Port 3000 allowed (TCP)
+Rule added and active
+
+
+PROMPT 6C: Enable/Disable Firewall
+───────────────────────────────────
+
+"enable firewall"
+
+or
+
+"disable firewall"
+
+⚠️ Disabling firewall requires confirmation
+
+What happens:
+- AI shows confirmation prompt
+- Asks: "Are you sure? This disables all firewall rules."
+- Only proceeds if you confirm with "yes"
+
+Expected response:
+⚠️ WARNING: Disabling firewall removes all protection.
+Type "yes" to confirm or "no" to cancel.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 7: SECURITY & PROTECTED OPERATIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+⚠️ BLOCKED OPERATIONS (Require Manual SSH)
+
+The following destructive operations are BLOCKED for safety:
+
+1. DELETE USER
+   Blocked: Cannot delete users via chat
+   
+   When you try: "delete user john"
+   Response: 
+   ❌ BLOCKED: User deletion is a destructive operation.
+   User to delete: john
+   ⚠️ SECURITY ALERT sent to Microsoft Teams.
+   
+   To proceed manually via SSH:
+   sudo userdel -r john
+
+2. DELETE PM2 APPLICATION
+   Blocked: Cannot delete PM2 processes via chat
+   
+   When you try: "delete pm-frontend"
+   Response:
+   ❌ BLOCKED: PM2 app deletion is a destructive operation.
+   App to delete: pm-frontend
+   ⚠️ SECURITY ALERT sent to Microsoft Teams.
+   
+   To proceed manually via SSH:
+   pm2 delete pm-frontend
+
+3. DELETE FIREWALL RULE
+   Blocked: Cannot delete firewall rules via chat
+   
+   When you try: "delete firewall rule 3000"
+   Response:
+   ❌ BLOCKED: Firewall rule deletion is a destructive operation.
+   Rule to delete: allow 3000/tcp
+   ⚠️ SECURITY ALERT sent to Microsoft Teams.
+   
+   To proceed manually via SSH:
+   sudo ufw delete allow 3000
+
+4. DELETE NGINX SITE
+   Blocked: Cannot delete Nginx sites via chat
+   
+   When you try: "delete nginx site deploy.meetri.in"
+   Response:
+   ❌ BLOCKED: Nginx site deletion is a destructive operation.
+   Site to delete: deploy.meetri.in
+   ⚠️ SECURITY ALERT sent to Microsoft Teams.
+   
+   To proceed manually via SSH:
+   sudo rm /etc/nginx/sites-{available,enabled}/deploy.meetri.in
+   sudo nginx -t && sudo systemctl reload nginx
+
+5. RESET FIREWALL
+   🚨 CRITICAL: Cannot reset firewall via chat (removes ALL rules!)
+   
+   When you try: "reset firewall"
+   Response:
+   🚨 BLOCKED: Firewall reset is an EXTREMELY destructive operation!
+   This will DELETE ALL firewall rules.
+   ⚠️ SECURITY ALERT sent to Microsoft Teams.
+   
+   Requires: Written approval from Security Team Lead
+   To proceed manually via SSH:
+   sudo ufw --force reset
+
+When any blocked operation is attempted:
+✓ Security alert automatically sent to Microsoft Teams
+✓ Clear reason given for the block
+✓ Manual SSH command provided for authorized users
+✓ Audit log created
+
+This prevents accidental data loss and ensures compliance.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 8: EXAMPLE WORKFLOWS
+═══════════════════════════════════════════════════════════════════════════════
+
+WORKFLOW 1: Deploy New Application to Production
+─────────────────────────────────────────────────
+
+Step 1: Deploy Application
+You:   "Deploy luna-backend from github.com/myrepo/luna-backend"
+
+AI:    ✅ Application deployed successfully
+       App: luna-backend
+       Port: 3000
+       Status: online
+
+Step 2: Configure Nginx
+You:   "Setup Nginx for luna-backend on domain api.meetri.in"
+
+AI:    ✅ Nginx configured successfully
+       Domain: api.meetri.in
+       Access: http://api.meetri.in
+
+Step 3: Setup SSL
+You:   "Configure SSL for api.meetri.in using admin@meetri.in"
+
+AI:    ✅ SSL certificate successfully obtained
+       Access: https://api.meetri.in
+       Auto-renewal: enabled
+
+Step 4: Monitor
+You:   "health check"
+
+AI:    ✅ Server Health Check - All Green
+       luna-backend: online
+       Nginx: running
+       CPU: 35%, RAM: 42%, Disk: 65%
+
+DONE! Your app is deployed, proxied, and secured.
+
+
+WORKFLOW 2: Update Application Code
+────────────────────────────────────
+
+You:   "redeploy luna-backend"
+
+AI:    ✅ Application redeployed successfully
+       - Git pull: 5 files changed
+       - npm install: 124 packages
+       - npm run build: successful
+       - pm2 restart: online
+
+DONE! New code is live.
+
+
+WORKFLOW 3: Emergency Fix
+─────────────────────────
+
+You:   "health check"
+
+AI:    ⚠️ pm-frontend is offline
+       [Auto-restarting...]
+       ✅ pm-frontend is back online
+       Teams alert sent
+
+DONE! Service automatically recovered.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 9: QUICK REFERENCE
+═══════════════════════════════════════════════════════════════════════════════
+
+DEPLOYMENT:
+  "Deploy [app] from [github-url]"
+  "Redeploy [app] from branch [branch-name]"
+  "Update environment variables for [app]"
+
+PM2 MANAGEMENT:
+  "Start [app]"
+  "Stop [app]"
+  "Restart [app]"
+  "Show pm2 status"
+  "Logs for [app]"
+
+NGINX & SSL:
+  "Configure Nginx for [app] on [domain]"
+  "Setup SSL for [domain]"
+  "Show Nginx configuration"
+
+MONITORING:
+  "Health check"
+  "Show server information"
+  "What's installed?"
+
+FIREWALL:
+  "Show firewall status"
+  "Allow port [port]"
+  "Enable/disable firewall"
+
+═══════════════════════════════════════════════════════════════════════════════
+ END OF GUIDE
+═══════════════════════════════════════════════════════════════════════════════

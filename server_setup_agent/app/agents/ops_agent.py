@@ -546,9 +546,28 @@ class OpsAgent:
         
         if name == "pm2_delete":
             app_name = args["app_name"]
-            logger.info(f"[OPS] PM2 DELETE: {app_name}")
-            result = self._exec(f"pm2 delete {app_name}")
-            return result + f"\n✅ App '{app_name}' deleted from PM2"
+            logger.critical(f"[SECURITY] DELETE PM2 APP ATTEMPT: {app_name}")
+            
+            # Send Teams alert
+            self.alerter.critical(
+                title="⚠️ DELETE PM2 APP REQUESTED",
+                server=self.server_label,
+                details=f"PM2 application deletion request: {app_name}\n\n"
+                       f"This will remove the app from PM2 permanently.\n"
+                       f"REQUIRES EXPLICIT CONFIRMATION from administrator."
+            )
+            
+            # Return error message instead of raising to avoid 500 error
+            return (
+                f"❌ BLOCKED: PM2 app deletion is a destructive operation.\n\n"
+                f"App to delete: {app_name}\n\n"
+                f"⚠️ SECURITY ALERT sent to Microsoft Teams.\n\n"
+                f"To proceed, you must:\n"
+                f"1. Verify this is intentional\n"
+                f"2. Get explicit approval from ops admin\n"
+                f"3. Run manually via SSH:\n"
+                f"   pm2 delete {app_name}"
+            )
         
         if name == "redeploy_app":
             app_name = args["app_name"]

@@ -455,21 +455,34 @@ server {{
         Removes the site config from both available and enabled.
         Uses domain name if provided, otherwise app_name.
         """
-        self.disable_site(app_name, domain)
+        # SAFETY: This is a destructive operation
+        config_name = domain if (domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null")) else app_name
         
-        # Use domain-based naming if domain is provided and valid
-        if domain and not self._is_ip(domain) and domain.strip() not in ("_", "", "none", "null"):
-            config_name = domain
-        else:
-            config_name = app_name
+        logger.critical(f"[SECURITY] DELETE NGINX SITE ATTEMPT: {config_name}")
         
-        available_path = f"/etc/nginx/sites-available/{config_name}"
-        exit_code, out, err = self.executor.execute(f"sudo rm -f {available_path}")
-        if exit_code != 0:
-            logger.error(f"Failed to delete available config for {config_name}: {err}")
-            raise RuntimeError(f"Failed to delete site config:\n{err}")
-        logger.info(f"Successfully deleted site {config_name} configs.")
-        return f"Site {config_name} deleted."
+        # Send Teams alert
+        from app.services.teams_alert_service import TeamsAlerter
+        alerter = TeamsAlerter()
+        alerter.critical(
+            title="⚠️ DELETE NGINX SITE REQUESTED",
+            server="Server",
+            details=f"Nginx site deletion request: {config_name}\n\n"
+                   f"This will remove the site configuration permanently.\n"
+                   f"REQUIRES EXPLICIT CONFIRMATION from administrator."
+        )
+        
+        raise RuntimeError(
+            f"❌ BLOCKED: Nginx site deletion is a destructive operation.\n\n"
+            f"Site to delete: {config_name}\n\n"
+            f"⚠️ SECURITY ALERT sent to Microsoft Teams.\n\n"
+            f"To proceed, you must:\n"
+            f"1. Verify this is intentional\n"
+            f"2. Get explicit approval from team lead\n"
+            f"3. Run manually via SSH:\n"
+            f"   sudo rm -f /etc/nginx/sites-available/{config_name}\n"
+            f"   sudo rm -f /etc/nginx/sites-enabled/{config_name}\n"
+            f"   sudo nginx -t && sudo systemctl reload nginx"
+        )
 
     def ensure_ws_map(self) -> str:
         """

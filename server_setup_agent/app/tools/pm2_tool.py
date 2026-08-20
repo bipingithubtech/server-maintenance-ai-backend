@@ -93,10 +93,30 @@ class PM2Tool:
 
     def delete(self, app_name: str) -> str:
         """Removes a PM2 process from the list."""
-        exit_code, out, err = self.executor.execute(f"pm2 delete {app_name}")
-        if exit_code != 0:
-            raise RuntimeError(f"Failed to delete {app_name}:\n{err}")
-        return f"PM2 process '{app_name}' deleted."
+        # SAFETY: This is a destructive operation
+        logger.critical(f"[SECURITY] DELETE PM2 APP ATTEMPT: {app_name}")
+        
+        # Send Teams alert
+        from app.services.teams_alert_service import TeamsAlerter
+        alerter = TeamsAlerter()
+        alerter.critical(
+            title="⚠️ DELETE PM2 APP REQUESTED",
+            server="Server",
+            details=f"PM2 app deletion request: {app_name}\n\n"
+                   f"This will remove the process from PM2 permanently.\n"
+                   f"REQUIRES EXPLICIT CONFIRMATION from administrator."
+        )
+        
+        raise RuntimeError(
+            f"❌ BLOCKED: PM2 app deletion is a destructive operation.\n\n"
+            f"App to delete: {app_name}\n\n"
+            f"⚠️ SECURITY ALERT sent to Microsoft Teams.\n\n"
+            f"To proceed, you must:\n"
+            f"1. Verify this is intentional\n"
+            f"2. Get explicit approval from team lead\n"
+            f"3. Run manually via SSH:\n"
+            f"   pm2 delete {app_name}"
+        )
 
     def save(self) -> str:
         """
