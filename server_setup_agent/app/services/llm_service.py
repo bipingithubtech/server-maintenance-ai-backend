@@ -84,3 +84,46 @@ def get_llm():
         )
 
     raise ValueError(f"Unsupported provider: {settings.LLM_PROVIDER}")
+
+
+class LLMService:
+    """
+    Wrapper service for LLM interactions.
+    Provides a simplified interface for generating responses.
+    """
+    
+    def __init__(self):
+        self.llm = get_llm()
+    
+    def generate(self, messages: list, temperature: float = 0.7) -> str:
+        """
+        Generate a response from the LLM given a list of messages.
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys
+            temperature: Temperature for generation (default: 0.7)
+            
+        Returns:
+            Generated response as a string
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+        
+        # Convert message dicts to LangChain message objects
+        langchain_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            
+            if role == "system":
+                langchain_messages.append(SystemMessage(content=content))
+            else:
+                langchain_messages.append(HumanMessage(content=content))
+        
+        # Update temperature if different from default
+        if temperature != self.llm.temperature:
+            self.llm.temperature = temperature
+        
+        # Generate response
+        response = self.llm.invoke(langchain_messages)
+        
+        return response.content

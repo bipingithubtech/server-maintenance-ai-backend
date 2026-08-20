@@ -31,7 +31,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "Run any shell command on the server. Use for status checks, installs, service restarts, anything not covered by other tools.",
+            "description": "Run shell command on server",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -43,7 +43,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file's contents from the server.",
+            "description": "Read file contents",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -55,7 +55,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Overwrite a file on the server with new content. Automatically backs up the original first.",
+            "description": "Edit file (auto-backup)",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -70,7 +70,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "audit_server",
-            "description": "Run a full server state audit — OS, users, ssh config, firewall, fail2ban, open ports, installed packages, pending updates, running services.",
+            "description": "Full server audit (OS, users, firewall, ports, services)",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -78,7 +78,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "firewall_status",
-            "description": "Check current UFW firewall status and list all open ports.",
+            "description": "Check firewall status",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -86,12 +86,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "firewall_allow",
-            "description": "Allow traffic on a specific port. Example: allow port 8080, or allow port 3000/tcp.",
+            "description": "Allow port",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "port": {"type": "string", "description": "Port number (e.g., '8080', '3000', '3306')"},
-                    "protocol": {"type": "string", "enum": ["tcp", "udp"], "default": "tcp"},
+                    "port": {"type": "string"},
+                    "protocol": {"type": "string", "enum": ["tcp", "udp"]},
                 },
                 "required": ["port"],
             },
@@ -101,12 +101,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "firewall_delete",
-            "description": "Remove/delete a firewall rule for a specific port. Example: delete rule for port 8080.",
+            "description": "Delete firewall rule",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "port": {"type": "string", "description": "Port number (e.g., '8080', '3000')"},
-                    "protocol": {"type": "string", "enum": ["tcp", "udp"], "default": "tcp"},
+                    "port": {"type": "string"},
+                    "protocol": {"type": "string", "enum": ["tcp", "udp"]},
                 },
                 "required": ["port"],
             },
@@ -116,7 +116,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "firewall_enable",
-            "description": "Enable the UFW firewall.",
+            "description": "Enable firewall",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -124,7 +124,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "firewall_disable",
-            "description": "Disable the UFW firewall (use with caution).",
+            "description": "Disable firewall",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -132,7 +132,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "firewall_reset",
-            "description": "Completely reset the firewall to factory defaults - removes ALL custom rules (very dangerous, requires confirmation).",
+            "description": "Reset firewall (dangerous)",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -140,12 +140,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "pm2_start",
-            "description": "Start or restart an app with PM2. Automatically detects start:prod or start script from package.json.",
+            "description": "Start/restart PM2 app",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "app_name": {"type": "string", "description": "App name/path (e.g., 'luna-backend' or '/home/meetri/api/luna-backend')"},
-                    "port": {"type": "string", "description": "Port number (optional, e.g., '3000')"},
+                    "app_name": {"type": "string"},
+                    "port": {"type": "string"},
                 },
                 "required": ["app_name"],
             },
@@ -155,7 +155,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "pm2_status",
-            "description": "Show all PM2 processes and their status.",
+            "description": "List PM2 processes",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -163,12 +163,70 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "pm2_logs",
-            "description": "Show logs for a specific PM2 app.",
+            "description": "Show PM2 logs",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "app_name": {"type": "string", "description": "App name (e.g., 'luna-backend')"},
-                    "lines": {"type": "integer", "description": "Number of lines to show (default: 50)"},
+                    "app_name": {"type": "string"},
+                    "lines": {"type": "integer"},
+                },
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pm2_stop",
+            "description": "Stop PM2 app",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string"},
+                },
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pm2_restart",
+            "description": "Restart PM2 app",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string"},
+                },
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pm2_delete",
+            "description": "Delete PM2 app",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string"},
+                },
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "redeploy_app",
+            "description": "Redeploy app (git pull, build, restart)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string"},
+                    "app_path": {"type": "string"},
+                    "branch": {"type": "string"},
                 },
                 "required": ["app_name"],
             },
@@ -178,15 +236,15 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "nginx_setup",
-            "description": "Configure Nginx for an app anytime (even after deployment). Can be used to add or reconfigure Nginx for apps that skipped it during deployment.",
+            "description": "Configure Nginx",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "app_name": {"type": "string", "description": "App name (e.g., 'luna-backend')"},
-                    "app_path": {"type": "string", "description": "Full app path (e.g., '/home/meetri/api/luna-backend')"},
-                    "port": {"type": "string", "description": "Internal port the app listens on (e.g., '3000')"},
-                    "domain": {"type": "string", "description": "Domain or IP for Nginx (e.g., 'pm.meetri.in' or '192.168.1.1')"},
-                    "app_type": {"type": "string", "enum": ["frontend", "backend"], "description": "App type: frontend (static files) or backend (process)"},
+                    "app_name": {"type": "string"},
+                    "app_path": {"type": "string"},
+                    "port": {"type": "string"},
+                    "domain": {"type": "string"},
+                    "app_type": {"type": "string", "enum": ["frontend", "backend"]},
                 },
                 "required": ["app_name", "app_path", "port", "domain", "app_type"],
             },
@@ -196,13 +254,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "configure_ssl",
-            "description": "Configure SSL/HTTPS for a domain using Let's Encrypt. Run this after deployment to set up SSL certificates.",
+            "description": "Configure SSL certificate",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "domain": {"type": "string", "description": "Domain to configure (e.g., 'deploy.meetri.in')"},
-                    "email": {"type": "string", "description": "Email for Let's Encrypt notifications (e.g., 'admin@meetri.in')"},
-                    "renewal_check": {"type": "boolean", "description": "Check existing certificate status before renewal (default: true)"},
+                    "domain": {"type": "string"},
+                    "email": {"type": "string"},
+                    "renewal_check": {"type": "boolean"},
                 },
                 "required": ["domain", "email"],
             },
@@ -212,17 +270,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "update_env",
-            "description": "Update or add environment variables to an application's .env file. Automatically backs up the file before editing.",
+            "description": "Update .env file",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "app_path": {"type": "string", "description": "Path to application directory (e.g., '/home/meetri/api/luna-backend')"},
-                    "env_vars": {
-                        "type": "object",
-                        "description": "Key-value pairs of environment variables to update (e.g., {'PORT': '3000', 'API_KEY': 'new_key'})",
-                        "additionalProperties": {"type": "string"}
-                    },
-                    "restart": {"type": "boolean", "description": "Restart the application after updating .env (default: true)"},
+                    "app_path": {"type": "string"},
+                    "env_vars": {"type": "object"},
+                    "restart": {"type": "boolean"},
                 },
                 "required": ["app_path", "env_vars"],
             },
@@ -478,6 +532,167 @@ class OpsAgent:
                 return f"⚠️ No logs for {app_name} (or command timed out after 10 seconds)"
             return result
         
+        if name == "pm2_stop":
+            app_name = args["app_name"]
+            logger.info(f"[OPS] PM2 STOP: {app_name}")
+            result = self._exec(f"pm2 stop {app_name}")
+            return result + f"\n✅ App '{app_name}' stopped"
+        
+        if name == "pm2_restart":
+            app_name = args["app_name"]
+            logger.info(f"[OPS] PM2 RESTART: {app_name}")
+            result = self._exec(f"pm2 restart {app_name}")
+            return result + f"\n✅ App '{app_name}' restarted"
+        
+        if name == "pm2_delete":
+            app_name = args["app_name"]
+            logger.info(f"[OPS] PM2 DELETE: {app_name}")
+            result = self._exec(f"pm2 delete {app_name}")
+            return result + f"\n✅ App '{app_name}' deleted from PM2"
+        
+        if name == "redeploy_app":
+            app_name = args["app_name"]
+            app_path = args.get("app_path")
+            branch = args.get("branch")  # Optional branch parameter
+            
+            logger.info(f"[OPS] REDEPLOY: {app_name}" + (f" (branch: {branch})" if branch else ""))
+            
+            # Auto-detect path if not provided
+            if not app_path:
+                # Try common locations
+                possible_paths = [
+                    f"/home/meetri/api/{app_name}",
+                    f"/home/meetri/ui/{app_name}",
+                    f"/opt/api/{app_name}",
+                    f"/opt/ui/{app_name}",
+                    f"/opt/{app_name}",
+                    f"/var/www/{app_name}",
+                ]
+                for path in possible_paths:
+                    check = self._exec(f"test -d {path} && echo 'exists' || echo 'not'")
+                    if "exists" in check:
+                        app_path = path
+                        logger.info(f"[OPS] Found app at: {app_path}")
+                        break
+                
+                if not app_path:
+                    return f"❌ Could not find app directory for '{app_name}'. Please specify app_path."
+            
+            # If user provided a parent directory, check if app is a subdirectory
+            # Example: user says "/home/meetri/ui" but app is in "/home/meetri/ui/pm-frontend"
+            git_check = self._exec(f"test -d {app_path}/.git && echo 'is_git' || echo 'not_git'")
+            if "not_git" in git_check:
+                logger.info(f"[REDEPLOY] {app_path} is not a git repo, checking for subdirectory")
+                # Check if app_name exists as subdirectory
+                subdir_path = f"{app_path}/{app_name}"
+                subdir_check = self._exec(f"test -d {subdir_path}/.git && echo 'found' || echo 'not'")
+                if "found" in subdir_check:
+                    logger.info(f"[REDEPLOY] Found git repo in subdirectory: {subdir_path}")
+                    app_path = subdir_path
+                else:
+                    return (
+                        f"❌ '{app_path}' is not a git repository.\n\n"
+                        f"I checked:\n"
+                        f"  • {app_path} - not a git repo\n"
+                        f"  • {subdir_path} - {'not found' if 'not' in subdir_check else 'not a git repo'}\n\n"
+                        f"Please provide the exact path to the git repository for '{app_name}'."
+                    )
+            
+            results = []
+            
+            # Detect if it's a Docker or PM2/regular app
+            docker_check = self._exec(f"docker ps -a --filter name={app_name} --format '{{{{.Names}}}}'")
+            is_docker = app_name in docker_check
+            
+            try:
+                # Step 1: Check/switch branch if specified
+                if branch:
+                    logger.info(f"[REDEPLOY] Switching to branch: {branch}")
+                    current_branch = self._exec(f"cd {app_path} && git branch --show-current")
+                    if current_branch.strip() != branch:
+                        branch_result = self._exec(f"cd {app_path} && git checkout {branch}")
+                        results.append(f"🔀 Switched to branch '{branch}':\n{branch_result}")
+                    else:
+                        results.append(f"✓ Already on branch '{branch}'")
+                
+                # Step 2: Git pull
+                logger.info(f"[REDEPLOY] Git pull in {app_path}")
+                git_result = self._exec(f"cd {app_path} && git pull")
+                results.append(f"📦 Git pull:\n{git_result}")
+                
+                if is_docker:
+                    # Docker workflow: down → build → up
+                    logger.info(f"[REDEPLOY] Docker app detected: {app_name}")
+                    
+                    # Check for docker-compose.yml
+                    compose_check = self._exec(f"test -f {app_path}/docker-compose.yml && echo 'exists' || echo 'not'")
+                    if "exists" not in compose_check:
+                        results.append(f"⚠️ No docker-compose.yml found in {app_path}")
+                        return "\n\n".join(results)
+                    
+                    # Down
+                    results.append(f"🛑 Stopping containers...")
+                    down_result = self._exec(f"cd {app_path} && docker compose down")
+                    results.append(f"  {down_result}")
+                    
+                    # Build
+                    results.append(f"🔨 Building new image...")
+                    build_result = self._exec(f"cd {app_path} && docker compose build")
+                    results.append(f"  {build_result}")
+                    
+                    # Up
+                    results.append(f"🚀 Starting containers...")
+                    up_result = self._exec(f"cd {app_path} && docker compose up -d")
+                    results.append(f"  {up_result}")
+                    
+                    results.append(f"✅ Docker app '{app_name}' redeployed successfully")
+                    
+                else:
+                    # PM2 workflow: install → build → restart
+                    logger.info(f"[REDEPLOY] PM2 app detected: {app_name}")
+                    
+                    # Check if package.json exists (Node.js app)
+                    pkg_check = self._exec(f"test -f {app_path}/package.json && echo 'exists' || echo 'not'")
+                    
+                    if "exists" in pkg_check:
+                        # Node.js app
+                        results.append(f"📦 Installing dependencies...")
+                        install_result = self._exec(f"cd {app_path} && npm install")
+                        results.append(f"  {install_result[:200]}")
+                        
+                        # Check if build script exists
+                        build_check = self._exec(f"grep -q '\"build\"' {app_path}/package.json && echo 'exists' || echo 'not'")
+                        if "exists" in build_check:
+                            results.append(f"🔨 Building application...")
+                            build_result = self._exec(f"cd {app_path} && npm run build")
+                            results.append(f"  Build completed")
+                    else:
+                        # Check for requirements.txt (Python app)
+                        req_check = self._exec(f"test -f {app_path}/requirements.txt && echo 'exists' || echo 'not'")
+                        if "exists" in req_check:
+                            results.append(f"📦 Installing Python dependencies...")
+                            pip_result = self._exec(f"cd {app_path} && pip install -r requirements.txt")
+                            results.append(f"  {pip_result[:200]}")
+                    
+                    # Restart PM2 process
+                    results.append(f"🔄 Restarting PM2 process...")
+                    
+                    # Check if app is in PM2
+                    pm2_check = self._exec(f"pm2 list --no-color | grep {app_name}")
+                    if app_name in pm2_check:
+                        restart_result = self._exec(f"pm2 restart {app_name}")
+                        results.append(f"  {restart_result}")
+                        results.append(f"✅ PM2 app '{app_name}' redeployed successfully")
+                    else:
+                        results.append(f"⚠️ App '{app_name}' not found in PM2. You may need to start it manually.")
+                
+                return "\n\n".join(results)
+                
+            except Exception as e:
+                logger.error(f"[REDEPLOY] Failed: {e}")
+                results.append(f"❌ Redeploy failed: {e}")
+                return "\n\n".join(results)
+        
         if name == "nginx_setup":
             app_name = args["app_name"]
             app_path = args["app_path"]
@@ -684,21 +899,15 @@ class OpsAgent:
     def execute_task(self, query: str, max_turns: int = 8) -> str:
         messages = [
             SystemMessage(content=(
-                "You are a Linux server operations assistant. You have tools to run "
-                "commands, read/edit files, and audit server state. Use them to "
-                "accomplish exactly what the user asks. Be surgical — don't make "
-                "changes beyond what was requested. Report clearly what you did.\n\n"
-                "IMPORTANT: When asked to update environment variables:\n"
-                "1. If the user provides a full path (e.g., /home/user/api/app-name), use it directly\n"
-                "2. If the user only provides an app name, assume it's in /home/meetri/api/APP-NAME\n"
-                "3. NEVER use 'find /' or 'grep -R /home' to search for apps - they are too slow\n"
-                "4. If uncertain about the path, ask the user instead of searching\n"
-                "5. If the user already provided the path in the conversation, USE IT - don't ask again\n"
-                "6. Execute the update immediately if you have both the path and the variables\n\n"
-                "Common app locations:\n"
-                "- /home/meetri/api/APP-NAME\n"
-                "- /opt/APP-NAME\n"
-                "- /var/www/APP-NAME"
+                "You are a Linux ops assistant. Use tools to execute user requests. "
+                "Be precise—only do what's asked. Report clearly.\n\n"
+                "For env updates:\n"
+                "- Full path provided? Use it\n"
+                "- App name only? Try /home/meetri/api/APP-NAME\n"
+                "- NEVER use find / or grep -R (too slow)\n"
+                "- Ask if uncertain\n"
+                "- Don't ask again if path already given\n"
+                "- Execute immediately when you have path + vars"
             )),
             HumanMessage(content=query),
         ]
