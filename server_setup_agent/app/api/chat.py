@@ -456,6 +456,22 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
         new_query = orig_request.get("query", "")
 
+    elif step == "nginx_sudo_password_needed":
+        # User provided their sudo password for nginx port fix
+        sudo_password = user_answer.strip()
+        if not sudo_password:
+            return QueryResponse(agent=agent_name, reason="Cancelled", result="Port change cancelled - no password provided.")
+        
+        # Store in credentials so executor has it
+        logger.info(f"[API] Stored sudo password for nginx port fix")
+        
+        # Add sudo_password to the credentials
+        if request.credentials:
+            request.credentials.sudo_password = sudo_password
+        
+        # Re-run the original query with sudo_password now available
+        new_query = orig_request.get("query", "")
+
     elif step == "need_env":
         # User answered the .env question
         answer = user_answer.strip().lower()

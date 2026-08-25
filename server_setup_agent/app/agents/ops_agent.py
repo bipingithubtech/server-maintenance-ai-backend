@@ -282,6 +282,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fix_nginx_port",
+            "description": "Fix nginx port configuration (change from old port to new port in all locations)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "config_file": {"type": "string"},
+                    "old_port": {"type": "string"},
+                    "new_port": {"type": "string"},
+                },
+                "required": ["config_file", "old_port", "new_port"],
+            },
+        },
+    },
 ]
 
 # Commands that must get explicit user confirmation before execution
@@ -296,7 +312,7 @@ VALIDATE_AFTER_EDIT = {
     "/etc/nginx/nginx.conf": "sudo nginx -t",
 }
 
-_TOOL_RESULT_MAX = 4000
+_TOOL_RESULT_MAX = 16000  # Increased to show full build errors and logs
 
 
 class OpsAgent:
@@ -636,7 +652,12 @@ class OpsAgent:
                 
                 # Step 2: Git pull
                 logger.info(f"[REDEPLOY] Git pull in {app_path}")
-                git_result = self._exec(f"cd {app_path} && git pull")
+                git_result = self._exec(f"cd {app_path} && git pull 2>&1")
+                # Check for git errors - capture full output
+                if "error" in git_result.lower() or "fatal" in git_result.lower() or "conflict" in git_result.lower():
+                    results.append(f"❌ Git pull FAILED")
+                    results.append(f"\n{git_result}\n")
+                    return "\n\n".join(results)
                 results.append(f"📦 Git pull:\n{git_result}")
                 
                 if is_docker:
@@ -657,11 +678,19 @@ class OpsAgent:
                     # Build
                     results.append(f"🔨 Building new image...")
                     build_result = self._exec(f"cd {app_path} && docker compose build")
+                    # Check for docker build errors
+                    if "error" in build_result.lower() or "failed" in build_result.lower():
+                        results.append(f"❌ Docker build failed:\n{build_result}")
+                        return "\n\n".join(results)
                     results.append(f"  {build_result}")
                     
                     # Up
                     results.append(f"🚀 Starting containers...")
                     up_result = self._exec(f"cd {app_path} && docker compose up -d")
+                    # Check for docker up errors
+                    if "error" in up_result.lower():
+                        results.append(f"❌ Docker containers failed to start:\n{up_result}")
+                        return "\n\n".join(results)
                     results.append(f"  {up_result}")
                     
                     results.append(f"✅ Docker app '{app_name}' redeployed successfully")
@@ -670,59 +699,116 @@ class OpsAgent:
                     # PM2 workflow: clean old build → install → build → restart
                     logger.info(f"[REDEPLOY] PM2 app detected: {app_name}")
                     
-                    # Check if package.json exists (Node.js app)
+                    # Check if package.json exists in app_path or subdirectories
                     pkg_check = self._exec(f"test -f {app_path}/package.json && echo 'exists' || echo 'not'")
+                    
+                    # If not in root, check subdirectories
+                    if "not" in pkg_check:
+                        logger.info(f"[REDEPLOY] package.json not in {app_path}, checking subdirectories")
+                        # Find package.json in subdirectories
+                        find_pkg = self._exec(f"find {app_path} -maxdepth 2 -name 'package.json' -type f | head -1")
+                        if find_pkg.strip():
+                            app_path = find_pkg.strip().rsplit('/', 1)[0]  # Get directory containing package.json
+                            logger.info(f"[REDEPLOY] Found package.json at: {app_path}")
+                            pkg_check = "exists"
                     
                     if "exists" in pkg_check:
                         # Node.js app
-                        # Step 1: Remove old node_modules and lock files
+                        # Step 1: Clean old build artifacts (dist, .next, build, etc.)
+                        results.append(f"🧹 Cleaning old build artifacts...")
+                        clean_builds = self._exec(f"cd {app_path} && rm -rf dist .next build out .vite .parcel-cache && echo 'cleaned'")
+                        results.append(f"  Removed dist, .next, build, out, .vite, .parcel-cache")
+                        
+                        # Step 2: Remove old node_modules and lock files
                         results.append(f"🧹 Cleaning old dependencies...")
                         clean_result = self._exec(f"cd {app_path} && rm -rf node_modules package-lock.json && echo 'cleaned'")
                         results.append(f"  Removed old node_modules and lock files")
                         
-                        # Step 2: Install fresh dependencies
+                        # Step 3: Install fresh dependencies
                         results.append(f"📦 Installing dependencies...")
-                        install_result = self._exec(f"cd {app_path} && npm ci")
-                        results.append(f"  Dependencies installed")
+                        # Use npm install (works with or without package-lock.json)
+                        install_result = self._exec(f"cd {app_path} && npm install 2>&1")
+                        results.append(f"Install output:\n{install_result}")
+                        # Check for npm errors - STRICT checking
+                        if "error" in install_result.lower() or "err" in install_result.lower():
+                            results.append(f"\n❌ INSTALL FAILED - See errors above")
+                            return "\n\n".join(results)
+                        results.append(f"✅ Dependencies installed successfully")
                         
-                        # Step 3: Build if build script exists
+                        # Step 4: Build if build script exists
                         build_check = self._exec(f"grep -q '\"build\"' {app_path}/package.json && echo 'exists' || echo 'not'")
                         if "exists" in build_check:
                             results.append(f"🔨 Building application...")
-                            build_result = self._exec(f"cd {app_path} && npm run build")
-                            results.append(f"  Build completed")
+                            build_result = self._exec(f"cd {app_path} && npm run build 2>&1")
+                            # ALWAYS append build output for debugging
+                            results.append(f"Build output:\n{build_result}")
+                            # Check for build errors - STRICT checking
+                            if "error" in build_result.lower() or "err" in build_result.lower() or "failed" in build_result.lower():
+                                results.append(f"\n❌ BUILD FAILED - See errors above")
+                                return "\n\n".join(results)
+                            if "found" in build_result.lower() and "error" in build_result.lower():
+                                results.append(f"\n❌ BUILD FAILED - Compilation errors detected")
+                                return "\n\n".join(results)
+                            results.append(f"✅ Build completed successfully")
+                        else:
+                            results.append(f"⚠️ No build script found in package.json")
                     else:
                         # Check for requirements.txt (Python app)
                         req_check = self._exec(f"test -f {app_path}/requirements.txt && echo 'exists' || echo 'not'")
                         if "exists" in req_check:
-                            # Step 1: Remove old venv and cache
+                            # Step 1: Clean old build artifacts
+                            results.append(f"🧹 Cleaning old build artifacts...")
+                            clean_builds = self._exec(f"cd {app_path} && rm -rf dist build *.egg-info .pytest_cache && echo 'cleaned'")
+                            results.append(f"  Removed dist, build, egg-info, pytest cache")
+                            
+                            # Step 2: Remove old venv and cache
                             results.append(f"🧹 Cleaning old environment...")
                             clean_result = self._exec(f"cd {app_path} && rm -rf venv __pycache__ *.pyc && echo 'cleaned'")
                             results.append(f"  Removed old venv and cache files")
                             
-                            # Step 2: Create fresh venv
+                            # Step 3: Create fresh venv
                             results.append(f"📦 Creating virtual environment...")
                             venv_result = self._exec(f"cd {app_path} && python3 -m venv venv")
+                            # Check for venv creation errors
+                            if "error" in venv_result.lower():
+                                results.append(f"❌ venv creation failed:\n{venv_result}")
+                                return "\n\n".join(results)
                             results.append(f"  Virtual environment created")
                             
-                            # Step 3: Install dependencies
+                            # Step 4: Install dependencies
                             results.append(f"📦 Installing dependencies...")
-                            pip_result = self._exec(f"cd {app_path} && source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt")
-                            results.append(f"  Dependencies installed")
+                            pip_result = self._exec(f"cd {app_path} && source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt 2>&1")
+                            # Check for pip errors
+                            if "error" in pip_result.lower() or "err" in pip_result.lower():
+                                results.append(f"❌ pip install FAILED")
+                                results.append(f"\n{pip_result}\n")
+                                return "\n\n".join(results)
+                            results.append(f"  Dependencies installed successfully")
+                        else:
+                            results.append(f"⚠️ No package.json or requirements.txt found - cannot determine app type")
                     
-                    # Step 4: Restart PM2 process
+                    # Step 5: Restart PM2 process
                     results.append(f"🔄 Restarting PM2 process...")
                     
                     # Check if app is in PM2
                     pm2_check = self._exec(f"pm2 list --no-color | grep {app_name}")
                     if app_name in pm2_check:
                         restart_result = self._exec(f"pm2 restart {app_name}")
+                        # Check for restart errors
+                        if "error" in restart_result.lower() or "err" in restart_result.lower():
+                            results.append(f"❌ PM2 restart FAILED")
+                            results.append(f"\n{restart_result}\n")
+                            final_msg = "\n\n".join(results)
+                            logger.error(f"[REDEPLOY] FAILED: {final_msg}")
+                            return final_msg
                         results.append(f"  {restart_result}")
                         results.append(f"✅ PM2 app '{app_name}' redeployed successfully (full rebuild)")
                     else:
                         results.append(f"⚠️ App '{app_name}' not found in PM2. You may need to start it manually.")
                 
-                return "\n\n".join(results)
+                final_msg = "\n\n".join(results)
+                logger.info(f"[REDEPLOY] SUCCESS: {app_name}")
+                return final_msg
                 
             except Exception as e:
                 logger.error(f"[REDEPLOY] Failed: {e}")
@@ -921,6 +1007,101 @@ class OpsAgent:
                 logger.error(f"[OPS] UPDATE ENV FAILED: {e}")
                 return f"❌ Failed to update environment variables: {e}"
         
+        if name == "fix_nginx_port":
+            config_file = args["config_file"]
+            old_port = args["old_port"]
+            new_port = args["new_port"]
+            
+            logger.info(f"[OPS] FIX NGINX PORT: {config_file} ({old_port} → {new_port})")
+            
+            try:
+                # Step 1: Check if file exists
+                check_result = self._exec(f"test -f {config_file} && echo 'exists' || echo 'not'")
+                if "not" in check_result:
+                    return f"❌ Nginx config file not found: {config_file}"
+                
+                # Step 2: Read current file
+                current_content = self._exec(f"cat {config_file}")
+                
+                # Check if old port exists
+                if old_port not in current_content:
+                    return f"⚠️ Port {old_port} not found in {config_file}\n\nFile currently shows port 5173 (unchanged)"
+                
+                # Step 3: Check if we have sudo password - if not, ask user for it
+                if not self.executor.sudo_password:
+                    # Ask user to provide sudo password via UI
+                    raise NeedsInputError(
+                        f"🔐 Sudo password required to complete port change\n\n"
+                        f"I need your sudo password to:\n"
+                        f"1. Replace :{old_port} with :{new_port}\n"
+                        f"2. Test nginx configuration (sudo nginx -t)\n"
+                        f"3. Reload nginx (sudo systemctl reload nginx)\n\n"
+                        f"Please enter your sudo password:",
+                        {
+                            "step": "nginx_sudo_password_needed",
+                            "config_file": config_file,
+                            "old_port": old_port,
+                            "new_port": new_port,
+                        },
+                    )
+                
+                # Step 4: Create backup
+                backup_cmd = f"sudo cp {config_file} {config_file}.bak.$(date +%s) 2>/dev/null || cp {config_file} {config_file}.bak"
+                self._exec(backup_cmd)
+                logger.info(f"[OPS] Backed up: {config_file}")
+                
+                # Step 5: Replace port in file using sed with sudo
+                sed_cmd = f"sudo sed -i 's/:{old_port}/:{new_port}/g' {config_file}"
+                result = self._exec(sed_cmd)
+                logger.info(f"[OPS] Port replacement executed: {sed_cmd}")
+                
+                # Step 6: Verify changes were made
+                verify_result = self._exec(f"grep {new_port} {config_file} | head -5")
+                replacements_found = verify_result.count(new_port)
+                
+                if replacements_found == 0:
+                    logger.warning(f"[OPS] Port replacement verification failed - may not have changed")
+                    return f"⚠️ Warning: Port replacement command ran but verification shows no changes. Please check manually."
+                
+                logger.info(f"[OPS] Verified {replacements_found} replacements of port {new_port}")
+                
+                # Step 7: Test and reload nginx
+                test_result = self._exec("sudo nginx -t 2>&1")
+                test_passed = "successful" in test_result.lower() or "ok" in test_result.lower() or "syntax is ok" in test_result.lower()
+                
+                if test_passed:
+                    # Nginx test passed - try to reload
+                    reload_result = self._exec("sudo systemctl reload nginx 2>&1")
+                    
+                    msg = f"✅ Nginx port configuration updated successfully\n\n"
+                    msg += f"• File: {config_file}\n"
+                    msg += f"• Changed: :{old_port} → :{new_port}\n"
+                    msg += f"• Replacements: {replacements_found} locations updated\n"
+                    msg += f"• Nginx test: PASSED ✓\n"
+                    msg += f"• Status: Nginx reloaded ✓\n"
+                    logger.info(f"[OPS] Nginx port fix completed successfully with reload")
+                    return msg
+                else:
+                    # Nginx test failed - show user manual commands
+                    msg = f"✅ Port Changed: :{old_port} → :{new_port}\n\n"
+                    msg += f"• File: {config_file}\n"
+                    msg += f"• Replacements: {replacements_found} locations updated ✓\n"
+                    msg += f"• Backup: {config_file}.bak\n\n"
+                    msg += f"⚠️ Could not test/reload nginx (SSL or permission issue)\n\n"
+                    msg += f"**Manual Commands to Complete:**\n"
+                    msg += f"```bash\n"
+                    msg += f"sudo nginx -t\n"
+                    msg += f"sudo systemctl reload nginx\n"
+                    msg += f"```\n"
+                    logger.info(f"[OPS] Nginx port changed but test skipped")
+                    return msg
+                
+            except NeedsInputError:
+                raise
+            except Exception as e:
+                logger.error(f"[OPS] FIX NGINX PORT FAILED: {e}")
+                return f"❌ Failed to fix nginx port: {e}"
+        
         return f"Unknown tool: {name}"
 
     @staticmethod
@@ -937,6 +1118,27 @@ class OpsAgent:
             SystemMessage(content=(
                 "You are a Linux ops assistant. Use tools to execute user requests. "
                 "Be precise—only do what's asked. Report clearly.\n\n"
+                "CRITICAL: For ANY redeploy request (redeploy, re-deploy, re deploy, update deployment, upgrade deployment, pull latest, update app):\n"
+                "1. MUST call the 'redeploy_app' tool (this is REQUIRED)\n"
+                "2. Extract app name from the user query\n"
+                "3. Pass app_name to redeploy_app\n"
+                "4. Do NOT use pm2_restart, pm2_stop, or other tools - ONLY use redeploy_app\n"
+                "5. The redeploy_app tool handles everything: git pull → clean build → rebuild → restart\n\n"
+                "For nginx port fixes:\n"
+                "- Use 'fix_nginx_port' tool to change port in nginx config files\n"
+                "- Extract old and new port from user query (e.g., '8000 to 9000' or '5173 to 4175')\n"
+                "- IMPORTANT: Nginx config files are named by domain/subdomain, NOT app name\n"
+                "  Examples: deploy.meetri.in, pm-frontend.conf, server-maintenance-ai.conf\n"
+                "- WORKFLOW:\n"
+                "  1. List configs: run_command 'ls /etc/nginx/sites-available/'\n"
+                "  2. Find EXACT match from user input (case-insensitive search)\n"
+                "  3. If exact match found → IMMEDIATELY call fix_nginx_port (user said 'update')\n"
+                "  4. If NO exact match but close match exists (fuzzy match):\n"
+                "     - Tell user: \"Did you mean: [suggestion]? Proceeding with change...\"\n"
+                "     - PROCEED with the change using the closest match\n"
+                "  5. If NO match at all → ask user to provide exact filename\n"
+                "- NEVER ask 'which one' if you found a likely match - just proceed and tell user\n"
+                "- Example paths: /etc/nginx/sites-available/deploy.meetri.in\n\n"
                 "For env updates:\n"
                 "- Full path provided? Use it\n"
                 "- App name only? Try /home/meetri/api/APP-NAME\n"
