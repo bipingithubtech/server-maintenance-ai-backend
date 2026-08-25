@@ -667,7 +667,7 @@ class OpsAgent:
                     results.append(f"✅ Docker app '{app_name}' redeployed successfully")
                     
                 else:
-                    # PM2 workflow: install → build → restart
+                    # PM2 workflow: clean old build → install → build → restart
                     logger.info(f"[REDEPLOY] PM2 app detected: {app_name}")
                     
                     # Check if package.json exists (Node.js app)
@@ -675,11 +675,17 @@ class OpsAgent:
                     
                     if "exists" in pkg_check:
                         # Node.js app
-                        results.append(f"📦 Installing dependencies...")
-                        install_result = self._exec(f"cd {app_path} && npm install")
-                        results.append(f"  {install_result[:200]}")
+                        # Step 1: Remove old node_modules and lock files
+                        results.append(f"🧹 Cleaning old dependencies...")
+                        clean_result = self._exec(f"cd {app_path} && rm -rf node_modules package-lock.json && echo 'cleaned'")
+                        results.append(f"  Removed old node_modules and lock files")
                         
-                        # Check if build script exists
+                        # Step 2: Install fresh dependencies
+                        results.append(f"📦 Installing dependencies...")
+                        install_result = self._exec(f"cd {app_path} && npm ci")
+                        results.append(f"  Dependencies installed")
+                        
+                        # Step 3: Build if build script exists
                         build_check = self._exec(f"grep -q '\"build\"' {app_path}/package.json && echo 'exists' || echo 'not'")
                         if "exists" in build_check:
                             results.append(f"🔨 Building application...")
@@ -689,11 +695,22 @@ class OpsAgent:
                         # Check for requirements.txt (Python app)
                         req_check = self._exec(f"test -f {app_path}/requirements.txt && echo 'exists' || echo 'not'")
                         if "exists" in req_check:
-                            results.append(f"📦 Installing Python dependencies...")
-                            pip_result = self._exec(f"cd {app_path} && pip install -r requirements.txt")
-                            results.append(f"  {pip_result[:200]}")
+                            # Step 1: Remove old venv and cache
+                            results.append(f"🧹 Cleaning old environment...")
+                            clean_result = self._exec(f"cd {app_path} && rm -rf venv __pycache__ *.pyc && echo 'cleaned'")
+                            results.append(f"  Removed old venv and cache files")
+                            
+                            # Step 2: Create fresh venv
+                            results.append(f"📦 Creating virtual environment...")
+                            venv_result = self._exec(f"cd {app_path} && python3 -m venv venv")
+                            results.append(f"  Virtual environment created")
+                            
+                            # Step 3: Install dependencies
+                            results.append(f"📦 Installing dependencies...")
+                            pip_result = self._exec(f"cd {app_path} && source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt")
+                            results.append(f"  Dependencies installed")
                     
-                    # Restart PM2 process
+                    # Step 4: Restart PM2 process
                     results.append(f"🔄 Restarting PM2 process...")
                     
                     # Check if app is in PM2
@@ -701,7 +718,7 @@ class OpsAgent:
                     if app_name in pm2_check:
                         restart_result = self._exec(f"pm2 restart {app_name}")
                         results.append(f"  {restart_result}")
-                        results.append(f"✅ PM2 app '{app_name}' redeployed successfully")
+                        results.append(f"✅ PM2 app '{app_name}' redeployed successfully (full rebuild)")
                     else:
                         results.append(f"⚠️ App '{app_name}' not found in PM2. You may need to start it manually.")
                 

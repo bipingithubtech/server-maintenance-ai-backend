@@ -11,8 +11,12 @@ __pycache__/
 *.so
 .pytest_cache/
 
+
 # Logs
 *.log
+
+# Documentation (ignore all markdown files)
+*.md
 
 # IDEs
 .vscode/

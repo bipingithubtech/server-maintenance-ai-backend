@@ -171,6 +171,13 @@ def _pre_route(query: str) -> Optional[str]:
     otherwise None (fall through to LLM supervisor).
     """
     q = query.lower().strip()
+    
+    # Redeploy detection: route to ops agent for simple pull + restart
+    # Matches: "redeploy", "re-deploy", "update deploy", etc.
+    redeploy_keywords = ("redeploy", "re-deploy", "re deploy", "update deployment", "upgrade deployment", "pull latest", "update app")
+    if any(keyword in q for keyword in redeploy_keywords):
+        return "ops"
+    
     if any(p in q for p in _INFO_PATTERNS):
         return "monitoring_info"
     if any(p in q for p in _HEALTH_PATTERNS):
@@ -520,6 +527,135 @@ async def _resume_conversation(state: dict, user_answer: str, request: QueryRequ
             prefill["nginx_choice"] = user_answer.strip()
         # Merge ctx_partial so all core fields are available on resume
         prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        new_query = orig_request.get("query", "")
+
+    elif step == "confirm_redeploy":
+        # User confirmed redeploy from current branch
+        answer = user_answer.strip().lower()
+        if answer not in ("yes", "y", "proceed", "ok"):
+            return QueryResponse(agent=agent_name, reason="Cancelled", result="Redeploy cancelled by user.")
+        
+        # User confirmed — prepare to redeploy from current branch
+        app_path = agent_state.get("app_path", "")
+        app_name = agent_state.get("app_name", "")
+        current_branch = agent_state.get("current_branch", "main")
+        
+        logger.info(f"[REDEPLOY] User confirmed redeploy for {app_name} from branch {current_branch}")
+        
+        # Set prefill to skip LLM and go straight to redeploy
+        # Load the last deployment context
+        import json as _json
+        try:
+            from pathlib import Path
+            deploy_ctx_file = Path(__file__).resolve().parent.parent.parent / "deployment_context.json"
+            if deploy_ctx_file.exists():
+                with open(deploy_ctx_file, "r") as f:
+                    last_ctx = _json.load(f)
+                
+                # Build prefill from last deployment
+                prefill["github_url"] = last_ctx.get("github_url", "")
+                prefill["stack"] = last_ctx.get("stack", "")
+                prefill["port"] = last_ctx.get("port", "")
+                prefill["domain"] = last_ctx.get("domain", "_")
+                prefill["process_manager"] = last_ctx.get("process_manager", "pm2")
+                prefill["branch"] = current_branch
+                prefill["app_path"] = app_path
+                prefill["app_name"] = app_name
+                prefill["redeploy"] = True  # Flag to skip clone and only pull + reinstall
+                prefill["env_vars"] = {}  # Will be read from server if exists
+                
+                logger.info(f"[REDEPLOY] Loaded context: {prefill['github_url']} → {prefill['stack']}")
+        except Exception as e:
+            logger.error(f"[REDEPLOY] Could not load deployment context: {e}")
+            return QueryResponse(
+                agent=agent_name,
+                reason="Error",
+                result=f"Could not load previous deployment context: {e}"
+            )
+        
+        new_query = orig_request.get("query", "")
+
+    elif step == "choose_redeploy_branch":
+        # User chose which branch to redeploy from (or confirm current)
+        answer = user_answer.strip().lower()
+        
+        current_branch = agent_state.get("current_branch", "main")
+        ctx_partial = agent_state.get("ctx_partial", {})
+        
+        # Determine which branch to use
+        if answer in ("yes", "y", "ok", ""):
+            # Use current branch
+            branch_to_deploy = current_branch
+        else:
+            # User provided a different branch name
+            branch_to_deploy = user_answer.strip()
+        
+        logger.info(f"[DEPLOY] User selected branch for redeploy: {branch_to_deploy}")
+        
+        # Mark as redeploy and set the branch to pull from
+        prefill["redeploy"] = True
+        prefill["current_branch"] = branch_to_deploy
+        
+        # Merge ctx_partial to have all deployment context
+        prefill.update({k: v for k, v in ctx_partial.items() if k not in prefill or not prefill[k]})
+        
+        logger.info(f"[DEPLOY] Prefill after update: redeploy={prefill.get('redeploy')}, branch={prefill.get('current_branch')}, app_path={prefill.get('app_path')}")
+        
+        new_query = orig_request.get("query", "")
+
+    elif step == "choose_same_folder_stack":
+        # User chose which stack to deploy (multiple stacks in same folder)
+        answer = user_answer.strip().lower()
+        detected_stacks = agent_state.get("detected_stacks", {})
+        
+        # Parse user choice (numeric or name)
+        selected_stack = None
+        try:
+            idx = int(answer) - 1
+            stacks_list = list(detected_stacks.keys())
+            if 0 <= idx < len(stacks_list):
+                selected_stack = stacks_list[idx]
+        except ValueError:
+            # Try name match
+            for stack_name in detected_stacks.keys():
+                if answer in stack_name.lower() or stack_name.lower() in answer:
+                    selected_stack = stack_name
+                    break
+        
+        if not selected_stack:
+            selected_stack = list(detected_stacks.keys())[0]  # Default to first
+        
+        logger.info(f"[DEPLOY] User selected stack: {selected_stack}")
+        prefill["stack"] = selected_stack
+        
+        # Merge ctx_partial so deployment continues with this stack
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        prefill["deploy_steps_done"] = True  # Mark that clone completed
+        new_query = orig_request.get("query", "")
+
+    elif step == "choose_monorepo_parts":
+        # User chose which part(s) of the monorepo to deploy
+        answer = user_answer.strip().lower()
+        detected_folders = agent_state.get("detected_folders", {})
+        
+        # Import deployment agent to reuse choice parsing logic
+        from app.agents.deployment_agent import DeploymentAgent
+        agent = DeploymentAgent(executor_type="local")  # Choice parsing is pure Python
+        selected_parts = agent._parse_deployment_choice(answer, detected_folders)
+        
+        logger.info(f"[DEPLOY] User selected monorepo parts: {selected_parts}")
+        
+        if not selected_parts:
+            selected_parts = list(detected_folders.keys())
+        
+        # Store detected folders and selected parts in prefill
+        prefill["detected_folders"] = detected_folders
+        prefill["selected_monorepo_parts"] = selected_parts
+        prefill["deploy_monorepo"] = True
+        
+        # Merge ctx_partial so deployment continues
+        prefill.update({k: v for k, v in agent_state.get("ctx_partial", {}).items() if k not in prefill or not prefill[k]})
+        prefill["deploy_steps_done"] = True  # Mark that clone completed
         new_query = orig_request.get("query", "")
 
     elif step == "confirm_fresh_clone":

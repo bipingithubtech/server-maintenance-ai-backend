@@ -246,6 +246,87 @@ class DeploymentAgent:
         pf       = getattr(self, '_prefill', None) or {}
         api_mode = True  # always API mode — CLI uses server_cli.py directly
 
+        # ── REDEPLOY DETECTION ─────────────────────────────────────────────
+        # Check if this is a redeploy request (pull latest from current branch)
+        if self._is_redeploy_query(query):
+            logger.info("[DEPLOY] Redeploy request detected")
+            
+            # Check if deployment_context.json exists to know where the app is deployed
+            if _DEPLOYMENT_CONTEXT_FILE.exists():
+                try:
+                    with open(_DEPLOYMENT_CONTEXT_FILE, "r") as f:
+                        last_deploy = json.load(f)
+                    
+                    app_path = last_deploy.get("app_path", "")
+                    app_name = last_deploy.get("app_name", "")
+                    github_url = last_deploy.get("github_url", "")
+                    stack = last_deploy.get("stack", "")
+                    port = last_deploy.get("port", "")
+                    domain = last_deploy.get("domain", "")
+                    process_manager = last_deploy.get("process_manager", "")
+                    
+                    if app_path and self._dir_exists(app_path):
+                        # Get the current branch deployed
+                        current_branch = self._get_current_git_branch(app_path)
+                        
+                        logger.info(f"[REDEPLOY] Current branch: {current_branch} at {app_path}")
+                        
+                        # Ask user: use this branch or provide a different one?
+                        raise NeedsInputError(
+                            f"📦 **Redeploy**\n\n"
+                            f"App: `{app_name}`\n"
+                            f"Current Branch: `{current_branch}`\n\n"
+                            f"Use this branch? Type:\n"
+                            f"  - **yes** to redeploy from `{current_branch}`\n"
+                            f"  - Branch name to redeploy from a different branch (e.g., 'develop', 'staging')",
+                            {
+                                "step": "choose_redeploy_branch",
+                                "app_path": app_path,
+                                "app_name": app_name,
+                                "current_branch": current_branch,
+                                "ctx_partial": {
+                                    "github_url": github_url,
+                                    "stack": stack,
+                                    "port": port,
+                                    "domain": domain,
+                                    "process_manager": process_manager,
+                                    "branch": current_branch,
+                                    "app_name": app_name,
+                                    "app_path": app_path,
+                                },
+                                "prefill": pf,
+                                "agent": "deployment",
+                            }
+                        )
+                except NeedsInputError:
+                    # Re-raise NeedsInputError (don't catch it as generic exception)
+                    raise
+                except json.JSONDecodeError:
+                    logger.warning("[REDEPLOY] deployment_context.json is invalid — treating as new deployment")
+                except Exception as e:
+                    logger.warning(f"[REDEPLOY] Could not read deployment context: {e} — treating as new deployment")
+
+        # ── REDEPLOY FAST-PATH: Skip all questions if redeploy is confirmed ────
+        # If user already chose branch (from previous turn), build context and return immediately
+        if pf.get("redeploy") and pf.get("current_branch"):
+            logger.info(f"[REDEPLOY FAST-PATH] Branch chosen: {pf.get('current_branch')}")
+            logger.info(f"[REDEPLOY FAST-PATH] Using app_path: {pf.get('app_path')}, github_url: {pf.get('github_url')}")
+            ctx = DeploymentContext(
+                github_url = pf.get("github_url", "https://github.com/x/x.git"),
+                stack      = pf.get("stack", ""),
+                port       = str(pf.get("port", "")),
+                domain     = pf.get("domain", "_"),
+                env_vars   = pf.get("env_vars", {}),
+                process_manager = pf.get("process_manager", ""),
+                branch     = pf.get("current_branch", "main"),
+                app_type   = pf.get("app_type", ""),
+            )
+            # Restore derived fields directly
+            ctx.app_name = pf.get("app_name", ctx.app_name)
+            ctx.app_path = pf.get("app_path", ctx.app_path)
+            logger.info(f"[REDEPLOY FAST-PATH] Returning context: app={ctx.app_name}, path={ctx.app_path}, branch={ctx.branch}")
+            return ctx
+
         # ── Early exit: all core fields already in prefill from a prior conversation turn ──
         # This happens after need_process_manager / need_branch / need_github_token steps.
         # Skip the LLM entirely and go straight to the post-LLM checks.
@@ -360,8 +441,12 @@ class DeploymentAgent:
                 ctx.app_type = "backend"
 
         # ── Deployment path ───────────────────────────────────────────
+        # For redeploy, skip this question - app_path is already set
         if pf.get("clone_dir"):
             ctx.app_path = pf["clone_dir"].rstrip("/")
+        elif pf.get("redeploy"):
+            # Redeploy: app_path already set from deployment_context.json
+            logger.info(f"[REDEPLOY] Using existing app_path: {ctx.app_path}")
         else:
             ctx._resolve_app_path()
             default_path = ctx.app_path
@@ -391,6 +476,9 @@ class DeploymentAgent:
             logger.info(f"[DEPLOY] Process manager set to: {ctx.process_manager}")
         elif pf.get("process_manager"):
             ctx.process_manager = pf["process_manager"]
+        elif pf.get("redeploy"):
+            # Redeploy: use same process manager as before (already in ctx from deployment_context.json)
+            logger.info(f"[REDEPLOY] Using existing process manager: {ctx.process_manager}")
         else:
             raise NeedsInputError(
                 "Which process manager should be used to run the app?\n"
@@ -407,6 +495,9 @@ class DeploymentAgent:
         # ── Branch selection ───────────────────────────────────────────
         if pf.get("branch"):
             ctx.branch = pf["branch"]
+        elif pf.get("redeploy"):
+            # Redeploy: branch already set from user choice in choose_redeploy_branch step
+            logger.info(f"[REDEPLOY] Using selected branch: {ctx.branch}")
         else:
             branches = self._fetch_branches(ctx.github_url)
             branch_list = ", ".join(f"{i+1}. {b}" for i, b in enumerate(branches)) if branches else ""
@@ -475,6 +566,10 @@ class DeploymentAgent:
         # ── .env vars ──────────────────────────────────────────────────
         if pf.get("env_vars") is not None:
             ctx.env_vars = pf["env_vars"]
+        elif pf.get("redeploy"):
+            # Redeploy: keep existing env vars (don't ask again)
+            logger.info(f"[REDEPLOY] Keeping existing .env vars")
+            ctx.env_vars = {}
         else:
             env_example_vars = []
             try:
@@ -597,6 +692,285 @@ class DeploymentAgent:
         except Exception as e:
             logger.error(f"Error reading env from server: {e}")
             return {}
+
+    # ── Multiple Files Detection (Monorepo Support) ───────────────────────────
+
+    def _get_current_git_branch(self, app_path: str) -> str:
+        """
+        Get the current git branch deployed at app_path.
+        Returns the branch name or 'unknown' if not a git repo.
+        """
+        try:
+            cmd = f"git -C {app_path} rev-parse --abbrev-ref HEAD 2>/dev/null"
+            code, out, _ = self.executor.execute(cmd)
+            if code == 0 and out.strip():
+                return out.strip()
+        except Exception as e:
+            logger.warning(f"[REDEPLOY] Could not determine current branch: {e}")
+        return "unknown"
+
+    def _is_redeploy_query(self, query: str) -> bool:
+        """
+        Check if this is a redeploy request.
+        Matches: "redeploy", "re-deploy", "update deploy", etc.
+        """
+        q_lower = query.lower()
+        redeploy_keywords = ("redeploy", "re-deploy", "re deploy", "update deployment", "upgrade deployment", "pull latest", "update app")
+        return any(keyword in q_lower for keyword in redeploy_keywords)
+
+    def _detect_deployable_folders(self, root_dir: str) -> dict:
+        """
+        Scan ALL immediate subfolders for deployment files.
+        Does NOT rely on folder names - detects by actual files.
+        
+        Returns:
+            {
+                "app-frontend": {      # Actual folder name (could be anything)
+                    "path": "app-frontend/",
+                    "stack": "nodejs",
+                    "file": "package.json",
+                    "default_port": 3000,
+                },
+                "api-service": {       # Actual folder name (could be anything)
+                    "path": "api-service/",
+                    "stack": "python",
+                    "file": "requirements.txt",
+                    "default_port": 8000,
+                },
+            }
+        """
+        found = {}
+        
+        try:
+            # List ALL immediate subdirectories
+            cmd = f"find {root_dir} -maxdepth 1 -type d ! -name '.' ! -name '.git' ! -name '.*' 2>/dev/null | sort"
+            code, out, _ = self.executor.execute(cmd)
+            
+            if code != 0 or not out.strip():
+                logger.info(f"[DETECT] No subdirectories found in {root_dir}")
+                return found
+            
+            folders = [f for f in out.strip().split("\n") if f.strip()]
+            logger.info(f"[DETECT] Found {len(folders)} subdirectories to scan")
+            
+            # For EACH folder, try to identify what it is by FILES it contains
+            for folder_path in folders:
+                folder_name = folder_path.rstrip("/").split("/")[-1]
+                
+                # Skip hidden folders and common non-app directories
+                if folder_name.startswith(".") or folder_name in ("node_modules", "__pycache__", ".git", ".github"):
+                    continue
+                
+                # Try to identify deployment type
+                deployment_info = self._identify_folder_by_files(folder_path)
+                
+                if deployment_info:
+                    found[folder_name] = deployment_info
+                    logger.info(f"[DETECT] {folder_name}: {deployment_info['stack']} ({deployment_info['file']})")
+        
+        except Exception as e:
+            logger.error(f"[DETECT] Error scanning directories: {e}")
+        
+        return found
+
+    def _identify_folder_by_files(self, folder_path: str) -> dict:
+        """
+        Identify what type of app is in this folder by checking for files.
+        Does NOT use folder name - only looks at files.
+        
+        Returns: dict with stack, file, default_port OR None if no files found
+        """
+        
+        # Check for each stack type (in priority order)
+        # Docker takes priority over language-specific files
+        checks = [
+            {
+                "stack": "docker",
+                "files": ["Dockerfile"],
+                "default_port": 8080,
+            },
+            {
+                "stack": "nodejs",
+                "files": ["package.json"],
+                "default_port": 3000,
+            },
+            {
+                "stack": "python",
+                "files": ["requirements.txt", "setup.py", "pyproject.toml", "pipfile"],
+                "default_port": 8000,
+            },
+            {
+                "stack": "ruby",
+                "files": ["Gemfile"],
+                "default_port": 3000,
+            },
+            {
+                "stack": "go",
+                "files": ["go.mod"],
+                "default_port": 8080,
+            },
+            {
+                "stack": "rust",
+                "files": ["Cargo.toml"],
+                "default_port": 8080,
+            },
+            {
+                "stack": "php",
+                "files": ["composer.json", "index.php"],
+                "default_port": 8000,
+            },
+            {
+                "stack": "java",
+                "files": ["pom.xml", "build.gradle"],
+                "default_port": 8080,
+            },
+            {
+                "stack": "dotnet",
+                "files": ["*.csproj"],
+                "default_port": 5000,
+            },
+        ]
+        
+        for check in checks:
+            for file_to_check in check["files"]:
+                # Handle glob patterns like *.csproj
+                if "*" in file_to_check:
+                    # Use find with glob
+                    cmd = f"find {folder_path} -maxdepth 1 -name '{file_to_check}' -type f 2>/dev/null | head -1"
+                    code, out, _ = self.executor.execute(cmd)
+                    if code == 0 and out.strip():
+                        return {
+                            "stack": check["stack"],
+                            "file": file_to_check,
+                            "default_port": check["default_port"],
+                        }
+                else:
+                    # Simple file check
+                    cmd = f"test -f {folder_path}/{file_to_check} && echo found 2>/dev/null"
+                    code, out, _ = self.executor.execute(cmd)
+                    
+                    if code == 0 and "found" in out:
+                        return {
+                            "stack": check["stack"],
+                            "file": file_to_check,
+                            "default_port": check["default_port"],
+                        }
+        
+        return None
+
+    def _detect_same_folder_multiple_stacks(self, root_dir: str) -> dict:
+        """
+        Detect if the same folder has multiple deployment files.
+        Example: package.json + requirements.txt in same directory
+        
+        Returns:
+            {
+                "nodejs": {"file": "package.json", "default_port": 3000},
+                "python": {"file": "requirements.txt", "default_port": 8000},
+            }
+        """
+        found = {}
+        
+        checks = [
+            {
+                "stack": "docker",
+                "files": ["Dockerfile"],
+                "default_port": 8080,
+            },
+            {
+                "stack": "nodejs",
+                "files": ["package.json"],
+                "default_port": 3000,
+            },
+            {
+                "stack": "python",
+                "files": ["requirements.txt", "setup.py", "pyproject.toml", "pipfile"],
+                "default_port": 8000,
+            },
+            {
+                "stack": "ruby",
+                "files": ["Gemfile"],
+                "default_port": 3000,
+            },
+            {
+                "stack": "go",
+                "files": ["go.mod"],
+                "default_port": 8080,
+            },
+            {
+                "stack": "rust",
+                "files": ["Cargo.toml"],
+                "default_port": 8080,
+            },
+        ]
+        
+        for check in checks:
+            for file_to_check in check["files"]:
+                cmd = f"test -f {root_dir}/{file_to_check} && echo found"
+                code, out, _ = self.executor.execute(cmd)
+                
+                if code == 0 and "found" in out:
+                    found[check["stack"]] = {
+                        "file": file_to_check,
+                        "default_port": check["default_port"],
+                    }
+                    break  # Found this stack, move to next
+        
+        return found
+
+    def _parse_deployment_choice(self, choice: str, available: dict) -> list:
+        """
+        Parse user choice for multiple deployment targets.
+        
+        Accepts:
+        - "1" or "2" (numeric indices, 1-indexed)
+        - "both" or "all" (deploy all)
+        - folder name or partial match
+        - comma-separated choices "1,2"
+        
+        Returns: list of folder names to deploy
+        """
+        choice = choice.strip().lower()
+        available_list = list(available.keys())
+        
+        # "both" or "all" — deploy all available
+        if choice in ("both", "all", "a", ""):
+            return available_list
+        
+        # Comma-separated choices "1,2" or "frontend,backend"
+        if "," in choice:
+            results = []
+            for part in choice.split(","):
+                part = part.strip().lower()
+                try:
+                    idx = int(part) - 1
+                    if 0 <= idx < len(available_list):
+                        results.append(available_list[idx])
+                except ValueError:
+                    # Try name match
+                    for folder in available_list:
+                        if part in folder.lower() or folder.lower() in part:
+                            if folder not in results:
+                                results.append(folder)
+                            break
+            return results if results else available_list
+        
+        # Single numeric choice "1" or "2"
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_list):
+                return [available_list[idx]]
+        except ValueError:
+            pass
+        
+        # Try name match "nodejs" or "frontend" or "app-frontend"
+        for folder in available_list:
+            if choice in folder.lower() or folder.lower() in choice:
+                return [folder]
+        
+        # Default to all if no match
+        logger.warning(f"[DEPLOY] Unknown choice '{choice}' — defaulting to all ({available_list})")
+        return available_list
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1308,36 +1682,230 @@ class DeploymentAgent:
 
         results = []
 
+        # ── Handle REDEPLOY (pull latest from current branch) ────────────────
+        if pf.get("redeploy"):
+            logger.info(f"[REDEPLOY] Pulling latest changes from {pf.get('current_branch', 'main')}")
+            
+            # Skip clone step, go straight to pull
+            branch = pf.get("current_branch", "main")
+            try:
+                # Pull latest changes
+                self._run(f"git -C {ctx.app_path} fetch origin {branch}")
+                self._run(f"git -C {ctx.app_path} reset --hard origin/{branch}")
+                results.append(f"✓ pull (branch: {branch})")
+            except Exception as e:
+                logger.error(f"[REDEPLOY FAILED] Pull failed: {e}")
+                self.alerter.critical(
+                    title=f"Redeploy FAILED: {ctx.app_name} — git pull error",
+                    server=self._server,
+                    details=str(e)[:300],
+                )
+                return f"REDEPLOY FAILED at git pull.\n{e}"
+            
+            # Skip to install step (don't clone, just pull and reinstall)
+            # Mark that we've already handled clone-equivalent
+            skip_clone = True
+        else:
+            skip_clone = False
+
         # ── Step 1: Clone ──────────────────────────────────────────────────
+        if not skip_clone:
+            try:
+                self._step_clone(ctx)
+                results.append("✓ clone")
+            except Exception as e:
+                from app.services.conversation_service import NeedsInputError
+                if isinstance(e, NeedsInputError):
+                    # Augment the error with full deployment context for proper resumption
+                    if not e.state:
+                        e.state = {}
+                    if "ctx_partial" not in e.state:
+                        e.state["ctx_partial"] = {
+                            "github_url": ctx.github_url,
+                            "stack": ctx.stack,
+                            "port": ctx.port,
+                            "domain": ctx.domain,
+                            "process_manager": ctx.process_manager,
+                            "branch": ctx.branch,
+                            "app_type": ctx.app_type,
+                            "app_name": ctx.app_name,
+                            "app_path": ctx.app_path,
+                        }
+                    raise  # Re-raise to let API handle the prompt
+                logger.error(f"[STEP 1 FAILED] {e}")
+                self.alerter.critical(
+                    title=f"Deployment FAILED: {ctx.app_name} — clone error",
+                    server=self._server,
+                    details=str(e)[:300],
+                )
+                return f"DEPLOYMENT FAILED at clone.\n{e}"
+
+        # ── Step 1.5: Detect monorepo/multiple files ───────────────────────
+        # After clone is successful, check if this is a monorepo or has multiple deployment files
         try:
-            self._step_clone(ctx)
-            results.append("✓ clone")
-        except Exception as e:
-            from app.services.conversation_service import NeedsInputError
-            if isinstance(e, NeedsInputError):
-                # Augment the error with full deployment context for proper resumption
-                if not e.state:
-                    e.state = {}
-                if "ctx_partial" not in e.state:
-                    e.state["ctx_partial"] = {
-                        "github_url": ctx.github_url,
-                        "stack": ctx.stack,
-                        "port": ctx.port,
-                        "domain": ctx.domain,
-                        "process_manager": ctx.process_manager,
-                        "branch": ctx.branch,
-                        "app_type": ctx.app_type,
-                        "app_name": ctx.app_name,
-                        "app_path": ctx.app_path,
+            # Check for multiple deployment files in the SAME FOLDER
+            same_folder_stacks = self._detect_same_folder_multiple_stacks(ctx.app_path)
+            if len(same_folder_stacks) > 1:
+                # Multiple stacks in the same folder — ask which to deploy
+                options = "\n".join(
+                    f"  {i+1}. {stack.upper()} ({info['file']})"
+                    for i, (stack, info) in enumerate(same_folder_stacks.items())
+                )
+                raise NeedsInputError(
+                    f"Multiple deployment files detected in the same folder:\n\n{options}\n\n"
+                    f"Which stack should I deploy?\n"
+                    f"(Enter number, e.g., '1', '2', or the stack name)",
+                    {
+                        "step": "choose_same_folder_stack",
+                        "detected_stacks": same_folder_stacks,
+                        "ctx_partial": {
+                            "github_url": ctx.github_url,
+                            "stack": ctx.stack,
+                            "port": ctx.port,
+                            "domain": ctx.domain,
+                            "process_manager": ctx.process_manager,
+                            "branch": ctx.branch,
+                            "app_type": ctx.app_type,
+                            "app_name": ctx.app_name,
+                            "app_path": ctx.app_path,
+                        },
+                        "prefill": pf,
+                        "agent": "deployment",
                     }
-                raise  # Re-raise to let API handle the prompt
-            logger.error(f"[STEP 1 FAILED] {e}")
-            self.alerter.critical(
-                title=f"Deployment FAILED: {ctx.app_name} — clone error",
-                server=self._server,
-                details=str(e)[:300],
-            )
-            return f"DEPLOYMENT FAILED at clone.\n{e}"
+                )
+            
+            # Check for multiple deployable folders (monorepo)
+            detected_folders = self._detect_deployable_folders(ctx.app_path)
+            
+            if len(detected_folders) > 1:
+                # Monorepo detected — ask which part(s) to deploy
+                options = "\n".join(
+                    f"  {i+1}. {folder_name.upper()} ({config['stack']}, port {config['default_port']})"
+                    for i, (folder_name, config) in enumerate(detected_folders.items())
+                )
+                options += f"\n  {len(detected_folders)+1}. ALL PARTS (deploy all)"
+                
+                raise NeedsInputError(
+                    f"Monorepo detected with multiple deployment targets:\n\n{options}\n\n"
+                    f"Which part(s) should I deploy?\n"
+                    f"(Enter number, e.g., '1', '2', '3', or 'both'/'all')",
+                    {
+                        "step": "choose_monorepo_parts",
+                        "detected_folders": detected_folders,
+                        "ctx_partial": {
+                            "github_url": ctx.github_url,
+                            "stack": ctx.stack,
+                            "port": ctx.port,
+                            "domain": ctx.domain,
+                            "process_manager": ctx.process_manager,
+                            "branch": ctx.branch,
+                            "app_type": ctx.app_type,
+                            "app_name": ctx.app_name,
+                            "app_path": ctx.app_path,
+                        },
+                        "prefill": pf,
+                        "agent": "deployment",
+                    }
+                )
+            
+            elif len(detected_folders) == 1:
+                # Single deployable folder found — update context to use it
+                folder_name = list(detected_folders.keys())[0]
+                folder_config = detected_folders[folder_name]
+                
+                logger.info(f"[MONOREPO] Single deployable folder detected: {folder_name} ({folder_config['stack']})")
+                
+                # Update context to deploy this specific folder
+                ctx.app_path = f"{ctx.app_path}/{folder_name}".rstrip("/")
+                
+                # Update stack if different from what LLM detected
+                # (in case LLM guess was wrong)
+                if folder_config['stack'] in DeploymentContext.FRONTEND_STACKS or folder_config['stack'] == 'nextjs':
+                    ctx.app_type = "frontend"
+                elif folder_config['stack'] in DeploymentContext.BACKEND_STACKS:
+                    ctx.app_type = "backend"
+                
+                logger.info(f"[MONOREPO] Updated deployment path to: {ctx.app_path}")
+        
+        except NeedsInputError:
+            # Re-raise monorepo choice questions
+            raise
+        except Exception as e:
+            # Log but don't fail on monorepo detection — user may have provided explicit path
+            logger.warning(f"[MONOREPO DETECTION] Error scanning for monorepo: {e}")
+
+        # ── Handle monorepo deployment (if user selected multiple parts) ─────
+        pf = getattr(self, '_prefill', None) or {}
+        if pf.get("deploy_monorepo") and pf.get("selected_monorepo_parts"):
+            # User chose to deploy multiple parts of monorepo
+            detected_folders = pf.get("detected_folders", {})
+            selected_parts = pf.get("selected_monorepo_parts", [])
+            
+            logger.info(f"[MONOREPO] Deploying {len(selected_parts)} part(s): {selected_parts}")
+            
+            # Deploy each part sequentially with incrementing ports
+            base_port = int(ctx.port)
+            for i, part_name in enumerate(selected_parts):
+                if part_name not in detected_folders:
+                    logger.warning(f"[MONOREPO] Skipping unknown part: {part_name}")
+                    continue
+                
+                config = detected_folders[part_name]
+                current_port = base_port + (i * 1000)  # Each part gets port+1000, port+2000, etc.
+                
+                logger.info(f"[MONOREPO] Deploying part {i+1}/{len(selected_parts)}: {part_name} (port {current_port})")
+                
+                # Create deployment context for this part
+                part_ctx = DeploymentContext(
+                    github_url=ctx.github_url,
+                    stack=config["stack"],
+                    port=str(current_port),
+                    app_path=f"{ctx.app_path}/{part_name}".rstrip("/"),
+                    app_type="frontend" if config["stack"] in DeploymentContext.FRONTEND_STACKS or config["stack"] == "nextjs" else "backend",
+                    process_manager=ctx.process_manager,
+                    domain=ctx.domain,
+                    branch=ctx.branch,
+                    env_vars=ctx.env_vars.copy() if ctx.env_vars else {},
+                )
+                part_ctx.app_name = f"{ctx.app_name}-{part_name}"
+                
+                try:
+                    # Write .env if needed
+                    if part_ctx.env_vars:
+                        self._step_write_env(part_ctx)
+                    
+                    # Install and start
+                    self._step_install(part_ctx)
+                    results.append(f"✓ {part_name} deployed on port {current_port}")
+                    
+                except Exception as e:
+                    logger.error(f"[MONOREPO PART FAILED] {part_name}: {e}")
+                    self.alerter.critical(
+                        title=f"Monorepo deployment FAILED for part: {part_name}",
+                        server=self._server,
+                        details=str(e)[:300],
+                    )
+                    results.append(f"✗ {part_name} FAILED: {str(e)[:100]}")
+                    # Continue to next part instead of aborting
+                    continue
+            
+            # After deploying all parts, move to nginx config
+            # Use the main ctx (frontend port) for nginx
+            try:
+                self._step_nginx(ctx)
+                results.append("✓ nginx")
+            except Exception as e:
+                from app.services.conversation_service import NeedsInputError
+                if isinstance(e, NeedsInputError):
+                    raise
+                logger.error(f"[MONOREPO NGINX FAILED] {e}")
+                results.append(f"⚠ nginx: {str(e)[:60]}")
+            
+            # Return summary
+            summary = "MONOREPO DEPLOYMENT COMPLETE\n"
+            summary += f"Parts deployed: {len(selected_parts)}\n"
+            summary += "\n".join(results)
+            return summary
 
         # ── Step 2: Write .env (only if vars collected) ────────────────────
         if ctx.env_vars:
@@ -1433,13 +2001,23 @@ class DeploymentAgent:
 
         # ── Success ────────────────────────────────────────────────────────
         summary = "\n".join(results)
+        
+        # Check if this was a redeploy
+        is_redeploy = pf.get("redeploy", False)
+        operation_type = "REDEPLOY" if is_redeploy else "DEPLOYMENT"
+        
         self.alerter.info(
-            title=f"Deployment SUCCESS: {ctx.app_name}",
+            title=f"{operation_type} SUCCESS: {ctx.app_name}",
             server=self._server,
             details=f"URL: http://{ctx.domain} | Port: {ctx.port} | Stack: {ctx.stack}",
         )
+        
+        status_header = f"{operation_type} COMPLETE"
+        if is_redeploy:
+            status_header += f"\n✓ Pulled latest from branch: {pf.get('current_branch', 'main')}"
+        
         return (
-            f"DEPLOYMENT COMPLETE\n"
+            f"{status_header}\n"
             f"App:    {ctx.app_name}\n"
             f"URL:    http://{ctx.domain}\n"
             f"Port:   {ctx.port}\n"
